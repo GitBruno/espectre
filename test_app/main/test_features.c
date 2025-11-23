@@ -1,7 +1,8 @@
 /*
- * ESPectre - Feature Extraction Unit Tests
+ * ESPectre - Feature Extraction Tests
  * 
- * Tests for CSI feature extraction and processing
+ * Tests feature extraction with real CSI data.
+ * Validates that features differ between baseline and movement states.
  * 
  * Author: Francesco Pace <francesco.pace@gmail.com>
  * License: GPLv3
@@ -9,112 +10,66 @@
 
 #include "test_case_esp.h"
 #include "csi_processor.h"
-#include "mock_csi_data.h"
-#include "esp_wifi_types.h"
+#include "real_csi_data_esp32_c6.h"
 #include <math.h>
 #include <string.h>
 
-// Test: CSI variance calculation
-TEST_CASE_ESP(csi_variance_calculation, "[features]")
-{
-    int8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8};
-    float variance = csi_calculate_variance(data, 8);
-    
-    // Variance should be > 0 for non-constant data
-    TEST_ASSERT_GREATER_THAN(0.0f, variance);
-}
+// Include CSI data arrays
+#include "real_csi_arrays.inc"
 
-// Test: Skewness calculation
-TEST_CASE_ESP(skewness_calculation, "[features]")
-{
-    int8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    float skewness = csi_calculate_skewness(data, 10);
-    
-    // Linear data should have skewness close to 0 (allow wider tolerance)
-    TEST_ASSERT_FLOAT_WITHIN(1.0f, 0.0f, skewness);
-}
+// Helper: extract all features for testing
+static const uint8_t test_all_features[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+#define EXTRACT_ALL_FEATURES(data, len, features) \
+    csi_extract_features(data, len, features, test_all_features, 10)
 
-// Test: Kurtosis calculation
-TEST_CASE_ESP(kurtosis_calculation, "[features]")
+// Test: Verify features are different between baseline and movement (using real data)
+TEST_CASE_ESP(features_differ_between_baseline_and_movement, "[features]")
 {
-    int8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    float kurtosis = csi_calculate_kurtosis(data, 10);
+    printf("\n=== FEATURE EXTRACTION TEST ===\n");
+    printf("Testing feature extraction with real CSI data\n");
+    printf("Baseline packets: %d, Movement packets: %d\n\n", 
+           num_baseline, num_movement);
     
-    // Kurtosis should be calculated (value depends on distribution)
-    TEST_ASSERT_NOT_EQUAL(0.0f, kurtosis);
-}
-
-// Test: Entropy calculation
-TEST_CASE_ESP(entropy_calculation, "[features]")
-{
-    int8_t data[] = {1, 1, 1, 1, 1};  // Low entropy (constant)
-    float entropy = csi_calculate_entropy(data, 5);
+    // Extract baseline features from real data
+    csi_features_t baseline_features;
+    EXTRACT_ALL_FEATURES(baseline_packets[0], 128, &baseline_features);
     
-    // Constant data should have low entropy
-    TEST_ASSERT_LESS_THAN(1.0f, entropy);
-}
-
-// Test: IQR calculation
-TEST_CASE_ESP(iqr_calculation, "[features]")
-{
-    int8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    float iqr = csi_calculate_iqr(data, 10);
+    // Extract movement features from real data
+    csi_features_t movement_features;
+    EXTRACT_ALL_FEATURES(movement_packets[0], 128, &movement_features);
     
-    // IQR should be > 0 for varied data
-    TEST_ASSERT_GREATER_THAN(0.0f, iqr);
-}
-
-// Test: Spatial variance
-TEST_CASE_ESP(spatial_variance_calculation, "[features]")
-{
-    // Use data with varying differences between adjacent elements
-    int8_t data[] = {1, 3, 2, 6, 4, 8, 5, 10};
-    float spatial_var = csi_calculate_spatial_variance(data, 8);
+    // Print feature comparison
+    printf("=== FEATURE COMPARISON ===\n");
+    printf("%-25s %12s %12s %10s\n", "Feature", "Baseline", "Movement", "Ratio");
+    printf("%-25s %12s %12s %10s\n", "-------", "--------", "--------", "-----");
     
-    TEST_ASSERT_GREATER_THAN(0.0f, spatial_var);
-}
-
-// Test: Spatial correlation
-TEST_CASE_ESP(spatial_correlation_calculation, "[features]")
-{
-    int8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8};
-    float correlation = csi_calculate_spatial_correlation(data, 8);
+    printf("%-25s %12.4f %12.4f %10.2fx\n", "Variance", 
+           baseline_features.variance, movement_features.variance,
+           movement_features.variance / (baseline_features.variance + 0.001f));
     
-    // Correlation should be between -1 and 1
-    TEST_ASSERT_GREATER_OR_EQUAL(-1.0f, correlation);
-    TEST_ASSERT_LESS_OR_EQUAL(1.0f, correlation);
-}
-
-// Test: Spatial gradient
-TEST_CASE_ESP(spatial_gradient_calculation, "[features]")
-{
-    int8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8};
-    float gradient = csi_calculate_spatial_gradient(data, 8);
+    printf("%-25s %12.4f %12.4f %10.2fx\n", "Spatial Gradient", 
+           baseline_features.spatial_gradient, movement_features.spatial_gradient,
+           movement_features.spatial_gradient / (baseline_features.spatial_gradient + 0.001f));
     
-    TEST_ASSERT_GREATER_THAN(0.0f, gradient);
-}
-
-// Test: Mock CSI data generation
-TEST_CASE_ESP(mock_csi_data_generation, "[features]")
-{
-    // Allocate buffer for CSI data
-    int8_t buffer[384];  // Max CSI length
-    wifi_csi_info_t csi_info = {
-        .buf = buffer,
-        .len = 0
-    };
+    printf("%-25s %12.4f %12.4f %10.2fx\n", "IQR", 
+           baseline_features.iqr, movement_features.iqr,
+           movement_features.iqr / (baseline_features.iqr + 0.001f));
     
-    generate_mock_csi_data(&csi_info, MOCK_CSI_STATIC);
+    printf("%-25s %12.4f %12.4f %10.2fx\n", "Entropy", 
+           baseline_features.entropy, movement_features.entropy,
+           movement_features.entropy / (baseline_features.entropy + 0.001f));
     
-    // Verify basic properties
-    TEST_ASSERT_EQUAL(128, csi_info.len);
+    printf("==========================\n\n");
     
-    // Verify that at least some data was generated (not all zeros)
-    int non_zero_count = 0;
-    for (int i = 0; i < csi_info.len; i++) {
-        if (csi_info.buf[i] != 0) {
-            non_zero_count++;
-        }
-    }
-    TEST_ASSERT_GREATER_THAN(0, non_zero_count);
+    // Verify that movement features are significantly different from baseline
+    // With real data, movement should have higher variance
+    TEST_ASSERT_GREATER_THAN(baseline_features.variance, movement_features.variance);
+    
+    // Verify features show clear separation (at least 1.5x ratio)
+    float variance_ratio = movement_features.variance / (baseline_features.variance + 0.001f);
+    TEST_ASSERT_TRUE(variance_ratio > 1.5f);
+    
+    printf("✅ Feature extraction test PASSED\n");
+    printf("   Movement features show clear separation from baseline\n");
+    printf("   Variance ratio: %.2fx (threshold: 1.5x)\n\n", variance_ratio);
 }

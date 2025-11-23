@@ -16,25 +16,22 @@
 
 #include "mqtt_handler.h"
 #include "config_manager.h"
-#include "statistics.h"
-#include "calibration.h"
 #include "csi_processor.h"
 #include "filters.h"
+#include "segmentation.h"
 
 // Command context - provides access to system state
 typedef struct {
     runtime_config_t *config;
-    float *threshold_high;
-    float *threshold_low;
-    stats_buffer_t *stats_buffer;
     csi_features_t *current_features;
-    detection_state_t *current_state;
+    segmentation_state_t *current_state;
     butterworth_filter_t *butterworth;
     filter_buffer_t *filter_buffer;
-    adaptive_normalizer_t *normalizer;
+    segmentation_context_t *segmentation;
     const char *mqtt_base_topic;
     const char *mqtt_cmd_topic;
     const char *mqtt_response_topic;
+    int64_t *system_start_time;  // Pointer to system start timestamp (for uptime calculation)
 } mqtt_cmd_context_t;
 
 /**
@@ -60,5 +57,14 @@ int mqtt_commands_process(const char *data, int data_len,
                          mqtt_cmd_context_t *context,
                          mqtt_handler_state_t *mqtt_state,
                          const char *response_topic);
+
+/**
+ * Capture CSI raw packet for data collection
+ * Called from csi_callback when raw capture is active
+ * 
+ * @param csi_data Raw CSI data (128 bytes)
+ * @param csi_len Length of CSI data
+ */
+void mqtt_commands_capture_csi_packet(const int8_t *csi_data, size_t csi_len);
 
 #endif // MQTT_COMMANDS_H

@@ -22,22 +22,16 @@
 // Default threshold for motion detection (optimized for amplitude skewness)
 #define DEFAULT_THRESHOLD 0.50f
 
+// Subcarrier selection limits
+#define MAX_SUBCARRIERS 64  // Maximum number of subcarriers that can be selected
+
 // Runtime configuration structure
 typedef struct {
-    // Logging
-    bool csi_logs_enabled;
+    // Logging (always enabled in monitor mode, disabled otherwise)
     bool verbose_mode;
     
-    // Detection parameters
-    uint8_t debounce_count;
-    float hysteresis_ratio;
-    int persistence_timeout;
-    float variance_scale;
-    
-    // Feature weights array (for both default and calibrated detection)
-    // Indices: 0=variance, 1=skewness, 2=kurtosis, 3=entropy, 4=iqr,
-    //          5=spatial_variance, 6=spatial_correlation, 7=spatial_gradient
-    float feature_weights[10];
+    // Feature extraction control
+    bool features_enabled;  // Enable/disable feature extraction during MOTION state
     
     // Filter settings
     bool hampel_filter_enabled;
@@ -59,13 +53,18 @@ typedef struct {
     // Smart publishing
     bool smart_publishing_enabled;
     
-    // Adaptive Normalizer settings
-    bool adaptive_normalizer_enabled;
-    float adaptive_normalizer_alpha;
-    uint32_t adaptive_normalizer_reset_timeout_sec;
-    
     // Traffic generator (for continuous CSI packets)
     uint32_t traffic_generator_rate;  // packets/sec (0=disabled, 1-50, recommended: 15)
+    
+    // Segmentation parameters (configurable at runtime)
+    float segmentation_k_factor;        // Threshold sensitivity (0.5-5.0)
+    uint16_t segmentation_window_size;  // Moving variance window (3-50 packets)
+    uint16_t segmentation_min_length;   // Minimum segment length (5-100 packets)
+    uint16_t segmentation_max_length;   // Maximum segment length (10-200 packets, 0=no limit)
+    
+    // Subcarrier selection (configurable at runtime)
+    uint8_t selected_subcarriers[MAX_SUBCARRIERS];  // Array of selected subcarrier indices (0-63)
+    uint8_t num_selected_subcarriers;               // Number of selected subcarriers (1-64)
 } runtime_config_t;
 
 /**
@@ -96,13 +95,11 @@ esp_err_t config_load_from_nvs(runtime_config_t *config, const nvs_config_data_t
  * Save configuration to NVS
  * 
  * @param config Configuration to save
- * @param threshold_high Current high threshold
- * @param threshold_low Current low threshold
+ * @param segmentation_threshold Current segmentation threshold
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t config_save_to_nvs(const runtime_config_t *config, 
-                             float threshold_high, 
-                             float threshold_low);
+                             float segmentation_threshold);
 
 /**
  * Check if configuration exists in NVS

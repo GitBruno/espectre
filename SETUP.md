@@ -7,9 +7,10 @@
 ---
 
 **Hardware:**
-- ESP32-S3-DevKitC-1 N16R8 (16MB Flash, 8MB PSRAM)
-- USB-C cable
-- Wi-Fi router (2.4 GHz)
+- **ESP32-S3**: Dual-core, 16MB Flash, 8MB PSRAM, better CPU performance
+- **ESP32-C6**: Single-core, 4MB Flash, WiFi 6, higher CSI packet rate
+- USB-C or Micro-USB cable (depending on board)
+- Wi-Fi router (2.4 GHz, ESP32-C6 supports WiFi 6 on 2.4 GHz)
 
 **Software:**
 - ESP-IDF v6.1
@@ -23,29 +24,29 @@
 
 ### 1. Install ESP-IDF
 
-**Linux:**
-```bash
-sudo apt-get install git wget flex bison gperf python3 python3-pip \
-  python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+**macOS (tested):**
 
-git clone --recursive https://github.com/espressif/esp-idf.git
-cd esp-idf && git checkout v6.1
-./install.sh esp32s3
-. ./export.sh
-```
+> **Note:** Tested on MacBook Air M2 with ESP-IDF v6.1-dev, but should also work with the latest stable version v5.5.1
 
-**macOS:**
 ```bash
 brew install cmake ninja dfu-util python3
 
 git clone --recursive https://github.com/espressif/esp-idf.git
-cd esp-idf && git checkout v6.1
-./install.sh esp32s3
+cd esp-idf && git checkout v6.1-dev
+./install.sh 
 . ./export.sh
 ```
 
-**Windows:**
-Download [ESP-IDF Windows Installer](https://dl.espressif.com/dl/esp-idf/)
+**Linux & Windows:**
+
+For Linux and Windows installation instructions, please refer to the official Espressif documentation:
+- 📖 [ESP-IDF Getting Started Guide for ESP32-S3](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/get-started/index.html)
+- 📖 [ESP-IDF Getting Started Guide for ESP32-C6](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/get-started/index.html)
+
+Make sure to:
+- Install ESP-IDF v6.1-dev: `git checkout v6.1-dev`
+- Run `./install.sh` (Linux) or `install.bat` (Windows)
+- Source the environment: `. ./export.sh` (Linux) or `export.bat` (Windows)
 
 ### 2. Clone and Configure
 
@@ -53,12 +54,24 @@ Download [ESP-IDF Windows Installer](https://dl.espressif.com/dl/esp-idf/)
 git clone https://github.com/francescopace/espectre.git
 cd espectre
 
-# Set target (IMPORTANT)
-idf.py set-target esp32s3
+# IMPORTANT: Copy the correct configuration for your ESP32 chip
+# This ensures all critical settings are properly applied
+
+# Clean any previous build and configuration
+idf.py fullclean
+rm -f sdkconfig
+
+# For ESP32-S3:
+cp sdkconfig.defaults.esp32s3 sdkconfig.defaults
+
+# For ESP32-C6:
+cp sdkconfig.defaults.esp32c6 sdkconfig.defaults
 
 # Configure Wi-Fi and MQTT
 idf.py menuconfig
 ```
+
+**Note:** By copying the target-specific file to `sdkconfig.defaults`, you ensure that all critical configurations (like `CONFIG_ESP_WIFI_CSI_ENABLED` and `CONFIG_SPIRAM`) are properly applied during the build process. The target will be automatically detected from the configuration file.
 
 In menuconfig:
 - Go to **ESPectre Configuration**
@@ -73,15 +86,13 @@ In menuconfig:
 # Build the project
 idf.py build
 
-# Flash to device
-# Linux
-idf.py -p /dev/ttyUSB0 flash
+# Flash to device (auto-detects port)
+idf.py flash
 
-# macOS (find port with: ls /dev/cu.*)
-idf.py -p /dev/cu.usbmodem* flash
-
-# Windows
-idf.py -p COM3 flash
+# Or specify port manually:
+# macOS: idf.py -p /dev/cu.usbmodem* flash
+# Linux: idf.py -p /dev/ttyUSB0 flash (or /dev/ttyACM0)
+# Windows: idf.py -p COM3 flash (check Device Manager for correct COM port)
 
 # Monitor serial output (optional but recommended)
 idf.py monitor
@@ -117,20 +128,32 @@ mqtt:
 
 ```yaml
 automation:
-  - alias: "Movement Alert"
+  - alias: "Movement Detection Alert"
     trigger:
-      - platform: numeric_state
+      - platform: state
         entity_id: sensor.movement_sensor
-        above: 0.6
-    condition:
-      - condition: template
-        value_template: "{{ state_attr('sensor.movement_sensor', 'confidence') > 0.7 }}"
+        to: "motion"
     action:
       - service: notify.mobile_app
         data:
-          message: "Movement detected!"
+          message: "Movement detected in monitored area"
+          
+  - alias: "Inactivity Alert"
+    trigger:
+      - platform: state
+        entity_id: sensor.movement_sensor
+        to: "idle"
+        for:
+          hours: 4
+    condition:
+      - condition: time
+        after: "08:00:00"
+        before: "22:00:00"
+    action:
+      - service: notify.mobile_app
+        data:
+          message: "No movement detected for 4 hours"
 ```
-
 ---
 
 ## MQTT Messages
@@ -140,20 +163,93 @@ automation:
 **Message format:**
 ```json
 {
-  "movement": 0.75,
-  "confidence": 0.85,
-  "state": "detected",
-  "threshold": 0.40,
+  "movement": 2.87,
+  "threshold": 2.20,
+  "state": "motion",
+  "packets_processed": 15234,
+  "features": {
+    "variance": 0.45,
+    "skewness": 0.12,
+    "kurtosis": 2.34,
+    "entropy": 3.21,
+    "iqr": 0.67,
+    "spatial_variance": 0.89,
+    "spatial_correlation": 0.76,
+    "spatial_gradient": 1.23,
+    "temporal_delta_mean": 0.34,
+    "temporal_delta_variance": 0.56
+  },
   "timestamp": 1730066405
 }
 ```
 
 **Fields:**
-- `movement`: 0.0-1.0 (intensity)
-- `confidence`: 0.0-1.0 (detection confidence)
-- `state`: "idle" or "detected"
-- `threshold`: current detection threshold
-- `timestamp`: Unix timestamp
+- `movement`: Moving variance value (float, typically 0.0-10.0) - indicates motion intensity
+- `threshold`: Adaptive threshold value (float) - current detection threshold
+- `state`: Current segmentation state - `"idle"` or `"motion"`
+- `packets_processed`: CSI packets processed since last publish (integer)
+- `features`: Object containing 10 extracted features (present when features extraction is enabled):
+  - `variance`: Signal variance
+  - `skewness`: Distribution asymmetry
+  - `kurtosis`: Distribution tailedness
+  - `entropy`: Signal randomness
+  - `iqr`: Interquartile range
+  - `spatial_variance`: Variance across subcarriers
+  - `spatial_correlation`: Correlation between adjacent subcarriers
+  - `spatial_gradient`: Rate of change across subcarriers
+  - `temporal_delta_mean`: Average change from previous packet
+  - `temporal_delta_variance`: Variance of changes from previous packet
+- `timestamp`: Unix timestamp (seconds since epoch)
+
+**Note:** The `features` object is included when feature extraction is enabled (default: enabled), regardless of the system state (idle or motion).
+
+---
+
+## Monitoring & Configuration Tools
+
+---
+
+ESPectre provides two tools for monitoring and configuration:
+
+### 🌐 Web-Based Monitor
+
+**`espectre-monitor.html`** - Modern web interface with visual controls and real-time charts.
+
+**Features:**
+- ✅ Real-time visualization with interactive charts
+- ✅ Live metrics dashboard (state, movement, threshold, segments)
+- ✅ Visual configuration of all parameters (sliders, toggles)
+- ✅ Device IP display
+- ✅ Statistics viewer with modal popup
+- ✅ Auto-sync configuration on connection
+- ✅ No terminal required - works in any browser
+- ✅ Cross-platform (desktop, tablet, mobile)
+
+**How to use:**
+1. Open `espectre-monitor.html` in your browser
+2. Configure MQTT connection (broker address, port, topic, credentials)
+3. Click "Connect"
+4. Monitor real-time data and configure parameters visually
+
+**Perfect for:**
+- First-time users
+- Visual parameter tuning
+- Real-time monitoring
+- Multi-device management
+
+### 🖥️ CLI Tool
+
+**`espectre-cli.py`** - Interactive command-line interface for advanced users and scripting.
+
+**Features:**
+- ✅ Interactive terminal session
+- ✅ Real-time command feedback
+- ✅ Scriptable for automation
+- ✅ Lightweight and fast
+
+**Quick start:**
+```bash
+./espectre-cli.py
 
 ---
 
@@ -161,11 +257,13 @@ automation:
 
 ---
 
-After installation, follow the **[Calibration & Tuning Guide](CALIBRATION.md)** to:
+After installation, follow the **[CALIBRATION.md](CALIBRATION.md)** to:
 - Calibrate the sensor for your environment
 - Optimize detection parameters
 - Troubleshoot common issues
 - Configure advanced features
+
+**Tip:** Use the web monitor (`espectre-monitor.html`) for easier visual tuning, or the CLI tool for advanced control.
 
 ---
 
@@ -173,12 +271,12 @@ After installation, follow the **[Calibration & Tuning Guide](CALIBRATION.md)** 
 
 ---
 
-ESPectre provides an **interactive CLI tool** (`espectre-cli.sh`) for easy configuration and calibration. The CLI automatically handles MQTT communication and provides real-time feedback.
+Both the web monitor and CLI tool use MQTT commands under the hood. You can also send commands directly via MQTT for scripting and automation.
 
 **Quick Start with CLI:**
 ```bash
 # Launch interactive mode
-./espectre-cli.sh
+./espectre-cli.py
 
 # In the interactive session, type commands directly:
 espectre> info          # Get current configuration
@@ -188,7 +286,6 @@ espectre> help          # Show all commands
 espectre> exit          # Exit CLI
 ```
 
-For detailed calibration and tuning instructions, see **[CALIBRATION.md](CALIBRATION.md)**.
 
 #### Direct MQTT Commands (for scripting/automation)
 
@@ -205,56 +302,49 @@ Responses are published to: `<your_topic>/response`
 
 **Available commands:**
 
-| Command | Parameter | Description | Example |
-|---------|-----------|-------------|---------|
-| `threshold` | float (0.0-1.0) | Set detection threshold | `{"cmd": "threshold", "value": 0.40}` |
-| `debounce` | int (1-10) | Set consecutive detections needed | `{"cmd": "debounce", "value": 3}` |
-| `persistence` | int (1-30) | Timeout in seconds before downgrading state | `{"cmd": "persistence", "value": 3}` |
-| `hysteresis` | float (0.1-1.0) | Ratio for threshold hysteresis | `{"cmd": "hysteresis", "value": 0.7}` |
-| `variance_scale` | float (100-2000) | Variance normalization scale | `{"cmd": "variance_scale", "value": 400}` |
-| `butterworth_filter` | bool | Enable/disable Butterworth low-pass filter (8Hz cutoff) | `{"cmd": "butterworth_filter", "enabled": true}` |
-| `wavelet_filter` | bool | Enable/disable Wavelet db4 filter (low-freq noise) | `{"cmd": "wavelet_filter", "enabled": true}` |
-| `wavelet_level` | int (1-3) | Wavelet decomposition level (3=max denoising) | `{"cmd": "wavelet_level", "value": 3}` |
-| `wavelet_threshold` | float (0.5-2.0) | Wavelet noise threshold (1.0=balanced) | `{"cmd": "wavelet_threshold", "value": 1.0}` |
-| `hampel_filter` | bool | Enable/disable Hampel outlier filter | `{"cmd": "hampel_filter", "enabled": true}` |
-| `hampel_threshold` | float (1.0-10.0) | Hampel filter sensitivity | `{"cmd": "hampel_threshold", "value": 2.0}` |
-| `savgol_filter` | bool | Enable/disable Savitzky-Golay smoothing | `{"cmd": "savgol_filter", "enabled": true}` |
-| `info` | none | Get current configuration (includes network, MQTT topics, filters, etc.) | `{"cmd": "info"}` |
-| `stats` | none | Get detection statistics | `{"cmd": "stats"}` |
-| `analyze` | none | Analyze data and get recommended threshold | `{"cmd": "analyze"}` |
-| `features` | none | Get all CSI features with calibration info (selected features show weight) | `{"cmd": "features"}` |
-| `logs` | bool | Enable/disable CSI logging | `{"cmd": "logs", "enabled": true}` |
-| `calibrate` | action + duration | Automatic calibration (start/stop/status) | `{"cmd": "calibrate", "action": "start", "duration": 60}` |
-| `smart_publishing` | bool | Enable/disable smart publishing (reduces MQTT traffic) | `{"cmd": "smart_publishing", "enabled": true}` |
-| `adaptive_normalizer` | bool | Enable/disable adaptive normalizer filter | `{"cmd": "adaptive_normalizer", "enabled": true}` |
-| `adaptive_normalizer_alpha` | float (0.001-0.1) | Set normalizer learning rate (lower = slower adaptation) | `{"cmd": "adaptive_normalizer_alpha", "value": 0.01}` |
-| `adaptive_normalizer_reset_timeout` | int (0-300) | Auto-reset timeout in seconds (0 = disabled) | `{"cmd": "adaptive_normalizer_reset_timeout", "value": 30}` |
-| `adaptive_normalizer_stats` | none | Get normalizer statistics (mean, variance, stddev) | `{"cmd": "adaptive_normalizer_stats"}` |
-| `traffic_generator_rate` | int (0-50) | Set WiFi traffic rate for continuous CSI (0=disabled, recommended: 15 pps) | `{"cmd": "traffic_generator_rate", "value": 15}` |
-| `factory_reset` | none | Restore all settings to factory defaults | `{"cmd": "factory_reset"}` |
-
-**Note:** Feature weights are automatically optimized through the calibration system. Manual weight adjustment has been removed. Use `./espectre-cli.sh calibrate start` to optimize weights for your environment.
+| Area | Command | Parameter | Description | Example |
+|------|---------|-----------|-------------|---------|
+| **System** | `info` | none | Get current configuration (network, MQTT topics, filters, segmentation params, options) | `{"cmd": "info"}` |
+| **System** | `stats` | none | Get runtime statistics (state, turbulence, variance, packets, segments, uptime) | `{"cmd": "stats"}` |
+| **System** | `traffic_generator_rate` | int (0-50) | Set WiFi traffic rate for continuous CSI (0=disabled, recommended: 15 pps) | `{"cmd": "traffic_generator_rate", "value": 15}` |
+| **System** | `smart_publishing` | bool | Enable/disable smart publishing (reduces MQTT traffic) | `{"cmd": "smart_publishing", "enabled": true}` |
+| **System** | `factory_reset` | none | Restore all settings to factory defaults | `{"cmd": "factory_reset"}` |
+| **Segmentation** | `segmentation_threshold` | float (0.5-10.0) | Set segmentation threshold for motion detection | `{"cmd": "segmentation_threshold", "value": 2.2}` |
+| **Segmentation** | `segmentation_k_factor` | float (0.5-5.0) | Set K factor for threshold sensitivity (higher = less sensitive) | `{"cmd": "segmentation_k_factor", "value": 2.0}` |
+| **Segmentation** | `segmentation_window_size` | int (3-50) | Set moving variance window size in packets | `{"cmd": "segmentation_window_size", "value": 10}` |
+| **Segmentation** | `segmentation_min_length` | int (5-100) | Set minimum segment length in packets | `{"cmd": "segmentation_min_length", "value": 10}` |
+| **Segmentation** | `segmentation_max_length` | int (0-200) | Set maximum segment length in packets (0=no limit) | `{"cmd": "segmentation_max_length", "value": 50}` |
+| **Segmentation** | `subcarrier_selection` | array of int (0-63) | Set selected subcarriers for CSI processing (1-64 subcarriers) | `{"cmd": "subcarrier_selection", "indices": [47,48,49,50,51,52,53,54]}` |
+| **Features** | `features_enable` | bool | Enable/disable feature extraction | `{"cmd": "features_enable", "enabled": true}` |
+| **Features** | `butterworth_filter` | bool | Enable/disable Butterworth low-pass filter (8Hz cutoff) | `{"cmd": "butterworth_filter", "enabled": true}` |
+| **Features** | `wavelet_filter` | bool | Enable/disable Wavelet db4 filter (low-freq noise) | `{"cmd": "wavelet_filter", "enabled": true}` |
+| **Features** | `wavelet_level` | int (1-3) | Wavelet decomposition level (3=max denoising) | `{"cmd": "wavelet_level", "value": 3}` |
+| **Features** | `wavelet_threshold` | float (0.5-2.0) | Wavelet noise threshold (1.0=balanced) | `{"cmd": "wavelet_threshold", "value": 1.0}` |
+| **Features** | `hampel_filter` | bool | Enable/disable Hampel outlier filter | `{"cmd": "hampel_filter", "enabled": true}` |
+| **Features** | `hampel_threshold` | float (1.0-10.0) | Hampel filter sensitivity | `{"cmd": "hampel_threshold", "value": 2.0}` |
+| **Features** | `savgol_filter` | bool | Enable/disable Savitzky-Golay smoothing | `{"cmd": "savgol_filter", "enabled": true}` |
 
 #### Info Command Response Structure
 
-The `info` command returns a comprehensive JSON object organized into logical groups:
+The `info` command returns **static configuration** organized into logical groups:
 
 ```json
 {
   "network": {
-    "ip_address": "192.168.1.100"
+    "ip_address": "192.168.1.100",
+    "traffic_generator_rate": 20
   },
   "mqtt": {
     "base_topic": "home/espectre/node1",
     "cmd_topic": "home/espectre/node1/cmd",
     "response_topic": "home/espectre/node1/response"
   },
-  "detection": {
-    "threshold": 0.4,
-    "debounce": 3,
-    "persistence_timeout": 5,
-    "hysteresis_ratio": 0.8,
-    "variance_scale": 500.0
+  "segmentation": {
+    "threshold": 2.2,
+    "window_size": 30,
+    "k_factor": 2.5,
+    "min_length": 10,
+    "max_length": 60
   },
   "filters": {
     "butterworth_enabled": true,
@@ -262,26 +352,61 @@ The `info` command returns a comprehensive JSON object organized into logical gr
     "wavelet_level": 3,
     "wavelet_threshold": 1.0,
     "hampel_enabled": false,
-    "hampel_threshold": 3.0,
-    "savgol_enabled": false,
-    "savgol_window_size": 5,
-    "adaptive_normalizer_enabled": true,
-    "adaptive_normalizer_alpha": 0.01,
-    "adaptive_normalizer_reset_timeout_sec": 60
+    "hampel_threshold": 2.0,
+    "savgol_enabled": true,
+    "savgol_window_size": 5
   },
-  "features": {
-    "csi_logs_enabled": true,
-    "smart_publishing_enabled": true
+  "options": {
+    "features_enabled": true,
+    "smart_publishing_enabled": false
+  },
+  "subcarriers": {
+    "indices": [47, 48, 49, 50, 51, 52, 53, 54],
+    "count": 8
   }
 }
 ```
 
 **Groups:**
-- **`network`**: Network information (IP address for ping/diagnostics)
+- **`network`**: Network information (IP address, traffic generator rate)
 - **`mqtt`**: MQTT topic configuration
-- **`detection`**: Core detection parameters
-- **`filters`**: Signal processing filters status
-- **`features`**: General capabilities and features
+- **`segmentation`**: Motion segmentation configuration parameters
+- **`filters`**: Signal processing filters configuration
+- **`options`**: General capabilities and features
+- **`subcarriers`**: Selected subcarriers for CSI processing (configurable at runtime)
+
+#### Stats Command Response Structure
+
+The `stats` command returns **runtime metrics** for monitoring:
+
+```json
+{
+  "timestamp": 1730066405,
+  "uptime": "3h 24m 15s",
+  "cpu_usage_percent": 5.4,
+  "heap_usage_percent": 22.3,
+  "state": "motion",
+  "turbulence": 3.45,
+  "movement": 2.87,
+  "threshold": 2.20,
+  "packets_processed": 15234
+}
+```
+
+**Fields:**
+- **`timestamp`**: Unix timestamp when stats were generated
+- **`uptime`**: System uptime in human-readable format
+- **`cpu_usage_percent`**: CPU usage percentage (0-100), calculated using FreeRTOS runtime statistics
+- **`heap_usage_percent`**: Heap memory usage percentage (0-100), calculated as (used/total)*100
+- **`state`**: Current segmentation state (idle/motion)
+- **`turbulence`**: Last spatial turbulence value (for diagnostics)
+- **`movement`**: Current moving variance (same as in periodic data)
+- **`threshold`**: Current adaptive threshold (same as in periodic data)
+- **`packets_processed`**: Total CSI packets processed
+
+**System Resource Monitoring:**
+- CPU and heap monitoring provide real-time visibility into system health
+- Useful for detecting performance issues and memory leaks
 
 ### Factory Reset
 
@@ -292,14 +417,11 @@ Restore all settings to factory defaults and clear all saved data from NVS:
 mosquitto_pub -h homeassistant.local -t "home/espectre/node1/cmd" \
   -m '{"cmd":"factory_reset"}'
 ```
-**Or use the interactive CLI** (see [CALIBRATION.md](CALIBRATION.md) for details).
 
 **This will:**
-- ✅ Clear all saved calibration data from NVS
 - ✅ Clear all saved configuration parameters from NVS
-- ✅ Restore all parameters to factory defaults
-- ✅ Reinitialize the calibration system
-- ⚠️ You will need to recalibrate after reset
+- ✅ Restore all parameters to factory defaults (filters, segmentation threshold)
+- ⚠️ You will need to reconfigure after reset
 
 **When to use:**
 - Configuration is corrupted or inconsistent
@@ -309,13 +431,13 @@ mosquitto_pub -h homeassistant.local -t "home/espectre/node1/cmd" \
 
 **Example using mosquitto_pub:**
 ```bash
-# Set threshold
+# Set segmentation threshold
 mosquitto_pub -h homeassistant.local -t "home/espectre/kitchen/cmd" \
-  -m '{"cmd": "threshold", "value": 0.35}'
+  -m '{"cmd": "segmentation_threshold", "value": 0.35}'
 
-# Get statistics
+# Get info
 mosquitto_pub -h homeassistant.local -t "home/espectre/kitchen/cmd" \
-  -m '{"cmd": "stats"}'
+  -m '{"cmd": "info"}'
 
 # Listen for response
 mosquitto_sub -h homeassistant.local -t "home/espectre/kitchen/response"
@@ -327,17 +449,15 @@ mosquitto_sub -h homeassistant.local -t "home/espectre/kitchen/response"
 
 ---
 
-**⚠️ IMPORTANT:** ESPectre requires continuous WiFi traffic to receive CSI packets. Without traffic, the ESP32 receives few/no CSI packets, resulting in poor detection and failed calibration.
+**⚠️ IMPORTANT:** ESPectre requires continuous WiFi traffic to receive CSI packets. Without traffic, the ESP32 receives few/no CSI packets, resulting in poor detection.
 
 **What it does:**
 - Generates UDP broadcast packets at configurable rate (default: 15 packets/sec)
 - Ensures continuous CSI data availability
-- Essential for reliable detection and calibration
+- Essential for reliable detection
 
 **Why it's needed:**
 - ESP32 only receives CSI when there's WiFi traffic
-- Without traffic generator: 10-20 samples during 60s calibration ❌
-- With traffic generator: 100+ samples during 60s calibration ✅
 
 **Configuration:**
 ```bash
@@ -354,7 +474,7 @@ traffic_generator_rate 15  # Enable 15 pps
 - **20 pps**: Busy environments with interference
 - **0 pps**: Disabled (only if you have other continuous WiFi traffic)
 
-**Note:** Rate is constant during both calibration and normal operation to ensure consistency.
+**Note:** Recommended rate is 20 pps for optimal detection performance.
 
 **Troubleshooting:**
 
@@ -383,7 +503,7 @@ mosquitto_pub -h localhost -t "espectre/cmd" -m '{"cmd":"wavelet_threshold","val
 
 **Or use the interactive CLI:**
 ```bash
-./espectre-cli.sh
+./espectre-cli.py
 > wv on
 > wvl 3
 > wvt 1.0
@@ -401,8 +521,8 @@ mosquitto_pub -h localhost -t "espectre/cmd" -m '{"cmd":"wavelet_threshold","val
 ---
 
 **How it works:**
-- Publishes immediately when detection state changes (idle ↔ detected)
-- Publishes when movement score changes by more than 0.05 (5%)
+- Publishes immediately when detection state changes (idle ↔ motion)
+- Publishes when movement score changes significantly
 - Publishes a heartbeat every 5 seconds even if nothing changed
 - Skips redundant messages when values are stable
 
@@ -419,8 +539,6 @@ mosquitto_pub -h localhost -t "espectre/cmd" -m '{"cmd":"wavelet_threshold","val
 mosquitto_pub -h homeassistant.local -t "home/espectre/node1/cmd" \
   -m '{"cmd":"smart_publishing","enabled":true}'
 ```
-
-**Or use the interactive CLI** (see [CALIBRATION.md](CALIBRATION.md) for details).
 
 **When to use:**
 - ✅ High-traffic MQTT brokers
@@ -478,7 +596,7 @@ If no messages appear:
 
 ---
 
-For detection issues, calibration problems, or advanced troubleshooting:
-- 📖 **See**: [Calibration & Tuning Guide](CALIBRATION.md)
-- 📝 **GitHub Issues**: [Report problems](https://github.com/francescopace/espectre/issues)
+For detection issues or parameter tuning:
+- 📖 **See**: [CALIBRATION.md](CALIBRATION.md)
+- � **GitHub Issues**: [Report problems](https://github.com/francescopace/espectre/issues)
 - 📧 **Email**: francesco.pace@gmail.com

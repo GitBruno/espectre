@@ -10,33 +10,28 @@
 #include "traffic_generator.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "cJSON.h"
 #include <string.h>
 #include <math.h>
 
 static const char *TAG = "MQTT_Commands";
 
-// Parameter validation constants (THRESHOLD_MIN/MAX defined in calibration.h)
-#define HYSTERESIS_MIN          0.1f
-#define HYSTERESIS_MAX          1.0f
-#define VARIANCE_SCALE_MIN      100.0f
-#define VARIANCE_SCALE_MAX      2000.0f
+// Parameter validation constants
 #define HAMPEL_THRESHOLD_MIN    1.0f
 #define HAMPEL_THRESHOLD_MAX    10.0f
 #define ALPHA_MIN               0.001f
 #define ALPHA_MAX               0.1f
 #define WAVELET_THRESHOLD_MIN   0.5f
 #define WAVELET_THRESHOLD_MAX   2.0f
-#define PERSISTENCE_MIN         1
-#define PERSISTENCE_MAX         30
-#define DEBOUNCE_MIN            1
-#define DEBOUNCE_MAX            10
 #define WAVELET_LEVEL_MIN       1
 #define WAVELET_LEVEL_MAX       3
 #define RESET_TIMEOUT_MAX       300
 #define TRAFFIC_RATE_MAX        50
-#define MIN_SAMPLES_ANALYZE     50
-#define DEFAULT_CALIBRATION_SAMPLES 1000
+
 // Global context for command handlers
 static mqtt_cmd_context_t *g_cmd_context = NULL;
 static mqtt_handler_state_t *g_mqtt_state = NULL;
@@ -108,48 +103,146 @@ static bool get_int_param(cJSON *root, const char *key, int *out_value,
     return true;
 }
 
-static void cmd_threshold(cJSON *root) {
+static void cmd_segmentation_threshold(cJSON *root) {
     float new_threshold;
-    if (get_float_param(root, "value", &new_threshold, THRESHOLD_MIN, THRESHOLD_MAX,
-                       "ERROR: Threshold must be between 0.0 and 1.0")) {
-        float old_threshold = *g_cmd_context->threshold_high;
-        *g_cmd_context->threshold_high = new_threshold;
-        *g_cmd_context->threshold_low = new_threshold * g_cmd_context->config->hysteresis_ratio;
-        
-        char response[256];
-        snprintf(response, sizeof(response), 
-                 "Threshold updated: %.4f -> %.4f", old_threshold, new_threshold);
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        esp_err_t err = config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "💾 Configuration saved to NVS");
+    if (get_float_param(root, "value", &new_threshold, 0.5f, 10.0f,
+                       "ERROR: Segmentation threshold must be between 0.5 and 10.0")) {
+        if (segmentation_set_threshold(g_cmd_context->segmentation, new_threshold)) {
+            char response[256];
+            snprintf(response, sizeof(response), 
+                     "Segmentation threshold updated: %.2f", new_threshold);
+            send_response(response);
+            ESP_LOGI(TAG, "%s", response);
+            
+            // Save to NVS
+            esp_err_t err = config_save_to_nvs(g_cmd_context->config, new_threshold);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "💾 Configuration saved to NVS");
+            } else {
+                ESP_LOGE(TAG, "❌ Failed to save configuration to NVS: %s", esp_err_to_name(err));
+            }
         } else {
-            ESP_LOGE(TAG, "❌ Failed to save configuration to NVS: %s", esp_err_to_name(err));
+            send_response("ERROR: Failed to set threshold");
         }
     }
 }
 
-static void cmd_stats(cJSON *root) {
-    stats_result_t result;
-    stats_buffer_analyze(g_cmd_context->stats_buffer, &result);
-    
-    cJSON *response = cJSON_CreateObject();
-    cJSON_AddNumberToObject(response, "min", (double)result.min);
-    cJSON_AddNumberToObject(response, "max", (double)result.max);
-    cJSON_AddNumberToObject(response, "avg", (double)result.mean);
-    cJSON_AddNumberToObject(response, "stddev", (double)result.stddev);
-    cJSON_AddNumberToObject(response, "threshold", (double)*g_cmd_context->threshold_high);
-    cJSON_AddNumberToObject(response, "samples", (double)result.count);
-    
-    char *json_str = cJSON_PrintUnformatted(response);
-    if (json_str) {
-        mqtt_send_response(g_mqtt_state, json_str, g_response_topic);
-        free(json_str);
+static void cmd_segmentation_k_factor(cJSON *root) {
+    float new_k_factor;
+    if (get_float_param(root, "value", &new_k_factor, 0.5f, 5.0f,
+                       "ERROR: K factor must be between 0.5 and 5.0")) {
+        if (segmentation_set_k_factor(g_cmd_context->segmentation, new_k_factor)) {
+            g_cmd_context->config->segmentation_k_factor = new_k_factor;
+            
+            char response[256];
+            snprintf(response, sizeof(response), 
+                     "K factor updated: %.2f (threshold sensitivity: %s)",
+                     new_k_factor, new_k_factor > 2.5f ? "less sensitive" : "more sensitive");
+            send_response(response);
+            ESP_LOGI(TAG, "%s", response);
+            
+            config_save_to_nvs(g_cmd_context->config, 
+                             segmentation_get_threshold(g_cmd_context->segmentation));
+        } else {
+            send_response("ERROR: Failed to set K factor");
+        }
     }
-    cJSON_Delete(response);
+}
+
+static void cmd_segmentation_window_size(cJSON *root) {
+    int new_window_size;
+    if (get_int_param(root, "value", &new_window_size, 3, 50,
+                     "ERROR: Window size must be between 3 and 50 packets")) {
+        if (segmentation_set_window_size(g_cmd_context->segmentation, (uint16_t)new_window_size)) {
+            g_cmd_context->config->segmentation_window_size = (uint16_t)new_window_size;
+            
+            char response[256];
+            snprintf(response, sizeof(response), 
+                     "Window size updated: %d packets (%.2fs @ 20Hz, %s)",
+                     new_window_size, new_window_size / 20.0f,
+                     new_window_size < 10 ? "more reactive" : "more stable");
+            send_response(response);
+            ESP_LOGI(TAG, "%s", response);
+            
+            config_save_to_nvs(g_cmd_context->config, 
+                             segmentation_get_threshold(g_cmd_context->segmentation));
+        } else {
+            send_response("ERROR: Failed to set window size");
+        }
+    }
+}
+
+static void cmd_segmentation_min_length(cJSON *root) {
+    int new_min_length;
+    if (get_int_param(root, "value", &new_min_length, 5, 100,
+                     "ERROR: Min length must be between 5 and 100 packets")) {
+        if (segmentation_set_min_length(g_cmd_context->segmentation, (uint16_t)new_min_length)) {
+            g_cmd_context->config->segmentation_min_length = (uint16_t)new_min_length;
+            
+            char response[256];
+            snprintf(response, sizeof(response), 
+                     "Min segment length updated: %d packets (%.2fs @ 20Hz)",
+                     new_min_length, new_min_length / 20.0f);
+            send_response(response);
+            ESP_LOGI(TAG, "%s", response);
+            
+            config_save_to_nvs(g_cmd_context->config, 
+                             segmentation_get_threshold(g_cmd_context->segmentation));
+        } else {
+            send_response("ERROR: Failed to set min length");
+        }
+    }
+}
+
+static void cmd_segmentation_max_length(cJSON *root) {
+    int new_max_length;
+    if (get_int_param(root, "value", &new_max_length, 0, 200,
+                     "ERROR: Max length must be 0 (no limit) or 10-200 packets")) {
+        // Special validation for 0 or valid range
+        if (new_max_length != 0 && new_max_length < 10) {
+            send_response("ERROR: Max length must be 0 (no limit) or at least 10 packets");
+            return;
+        }
+        
+        if (segmentation_set_max_length(g_cmd_context->segmentation, (uint16_t)new_max_length)) {
+            g_cmd_context->config->segmentation_max_length = (uint16_t)new_max_length;
+            
+            char response[256];
+            if (new_max_length == 0) {
+                snprintf(response, sizeof(response), 
+                         "Max segment length updated: no limit");
+            } else {
+                snprintf(response, sizeof(response), 
+                         "Max segment length updated: %d packets (%.2fs @ 20Hz)",
+                         new_max_length, new_max_length / 20.0f);
+            }
+            send_response(response);
+            ESP_LOGI(TAG, "%s", response);
+            
+            config_save_to_nvs(g_cmd_context->config, 
+                             segmentation_get_threshold(g_cmd_context->segmentation));
+        } else {
+            send_response("ERROR: Failed to set max length");
+        }
+    }
+}
+
+static void cmd_features_enable(cJSON *root) {
+    bool enabled;
+    if (get_bool_param(root, "enabled", &enabled)) {
+        g_cmd_context->config->features_enabled = enabled;
+        char response[128];
+        snprintf(response, sizeof(response), "Feature extraction %s", 
+                 enabled ? "enabled" : "disabled");
+        send_response(response);
+        ESP_LOGI(TAG, "%s", response);
+        
+        esp_err_t err = config_save_to_nvs(g_cmd_context->config, 
+                                           g_cmd_context->segmentation->adaptive_threshold);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "💾 Configuration saved to NVS");
+        }
+    }
 }
 
 static void cmd_info(cJSON *root) {
@@ -170,6 +263,7 @@ static void cmd_info(cJSON *root) {
     } else {
         cJSON_AddStringToObject(network, "ip_address", "not available");
     }
+    cJSON_AddNumberToObject(network, "traffic_generator_rate", g_cmd_context->config->traffic_generator_rate);
     cJSON_AddItemToObject(response, "network", network);
     
     // MQTT topics
@@ -185,17 +279,14 @@ static void cmd_info(cJSON *root) {
     }
     cJSON_AddItemToObject(response, "mqtt", mqtt);
     
-    // Detection parameters
-    cJSON *detection = cJSON_CreateObject();
-    cJSON_AddNumberToObject(detection, "threshold", (double)*g_cmd_context->threshold_high);
-    cJSON_AddNumberToObject(detection, "debounce", g_cmd_context->config->debounce_count);
-    cJSON_AddNumberToObject(detection, "persistence_timeout", g_cmd_context->config->persistence_timeout);
-    cJSON_AddNumberToObject(detection, "hysteresis_ratio", (double)g_cmd_context->config->hysteresis_ratio);
-    cJSON_AddNumberToObject(detection, "variance_scale", (double)g_cmd_context->config->variance_scale);
-    cJSON_AddItemToObject(response, "detection", detection);
-    
-    // Traffic generator
-    cJSON_AddNumberToObject(response, "traffic_generator_rate", g_cmd_context->config->traffic_generator_rate);
+    // Segmentation parameters (configuration only - runtime metrics moved to stats command)
+    cJSON *segmentation = cJSON_CreateObject();
+    cJSON_AddNumberToObject(segmentation, "threshold", (double)segmentation_get_threshold(g_cmd_context->segmentation));
+    cJSON_AddNumberToObject(segmentation, "window_size", segmentation_get_window_size(g_cmd_context->segmentation));
+    cJSON_AddNumberToObject(segmentation, "k_factor", (double)segmentation_get_k_factor(g_cmd_context->segmentation));
+    cJSON_AddNumberToObject(segmentation, "min_length", segmentation_get_min_length(g_cmd_context->segmentation));
+    cJSON_AddNumberToObject(segmentation, "max_length", segmentation_get_max_length(g_cmd_context->segmentation));
+    cJSON_AddItemToObject(response, "segmentation", segmentation);
     
     // Filters configuration
     cJSON *filters = cJSON_CreateObject();
@@ -207,16 +298,23 @@ static void cmd_info(cJSON *root) {
     cJSON_AddNumberToObject(filters, "hampel_threshold", (double)g_cmd_context->config->hampel_threshold);
     cJSON_AddBoolToObject(filters, "savgol_enabled", g_cmd_context->config->savgol_filter_enabled);
     cJSON_AddNumberToObject(filters, "savgol_window_size", g_cmd_context->config->savgol_window_size);
-    cJSON_AddBoolToObject(filters, "adaptive_normalizer_enabled", g_cmd_context->config->adaptive_normalizer_enabled);
-    cJSON_AddNumberToObject(filters, "adaptive_normalizer_alpha", (double)g_cmd_context->config->adaptive_normalizer_alpha);
-    cJSON_AddNumberToObject(filters, "adaptive_normalizer_reset_timeout_sec", g_cmd_context->config->adaptive_normalizer_reset_timeout_sec);
     cJSON_AddItemToObject(response, "filters", filters);
     
-    // Features/capabilities
-    cJSON *features = cJSON_CreateObject();
-    cJSON_AddBoolToObject(features, "csi_logs_enabled", g_cmd_context->config->csi_logs_enabled);
-    cJSON_AddBoolToObject(features, "smart_publishing_enabled", g_cmd_context->config->smart_publishing_enabled);
-    cJSON_AddItemToObject(response, "features", features);
+    // Options
+    cJSON *options = cJSON_CreateObject();
+    cJSON_AddBoolToObject(options, "smart_publishing_enabled", g_cmd_context->config->smart_publishing_enabled);
+    cJSON_AddBoolToObject(options, "features_enabled", g_cmd_context->config->features_enabled);
+    cJSON_AddItemToObject(response, "options", options);
+    
+    // Subcarrier selection
+    cJSON *subcarriers = cJSON_CreateObject();
+    cJSON *indices_array = cJSON_CreateArray();
+    for (uint8_t i = 0; i < g_cmd_context->config->num_selected_subcarriers; i++) {
+        cJSON_AddItemToArray(indices_array, cJSON_CreateNumber(g_cmd_context->config->selected_subcarriers[i]));
+    }
+    cJSON_AddItemToObject(subcarriers, "indices", indices_array);
+    cJSON_AddNumberToObject(subcarriers, "count", g_cmd_context->config->num_selected_subcarriers);
+    cJSON_AddItemToObject(response, "subcarriers", subcarriers);
     
     char *json_str = cJSON_PrintUnformatted(response);
     if (json_str) {
@@ -226,218 +324,98 @@ static void cmd_info(cJSON *root) {
     cJSON_Delete(response);
 }
 
-static void cmd_logs(cJSON *root) {
-    bool enabled;
-    if (get_bool_param(root, "enabled", &enabled)) {
-        g_cmd_context->config->csi_logs_enabled = enabled;
-        char response[64];
-        snprintf(response, sizeof(response), "CSI logs %s", 
-                 enabled ? "enabled" : "disabled");
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-    }
-}
-
-static void cmd_analyze(cJSON *root) {
-    if (g_cmd_context->stats_buffer->count < MIN_SAMPLES_ANALYZE) {
-        char response[128];
-        snprintf(response, sizeof(response), 
-                 "ERROR: Need at least %d samples (have %lu)", 
-                 MIN_SAMPLES_ANALYZE,
-                 (unsigned long)g_cmd_context->stats_buffer->count);
-        send_response(response);
-        return;
-    }
+// Format uptime as human-readable string (e.g., "3h 24m 15s")
+static void format_uptime(char *buffer, size_t size, int64_t uptime_sec) {
+    int hours = uptime_sec / 3600;
+    int minutes = (uptime_sec % 3600) / 60;
+    int seconds = uptime_sec % 60;
     
-    stats_result_t result;
-    stats_buffer_analyze(g_cmd_context->stats_buffer, &result);
-    
-    float p25 = stats_buffer_percentile(g_cmd_context->stats_buffer, 25.0f);
-    float p50 = stats_buffer_percentile(g_cmd_context->stats_buffer, 50.0f);
-    float p75 = stats_buffer_percentile(g_cmd_context->stats_buffer, 75.0f);
-    float p95 = stats_buffer_percentile(g_cmd_context->stats_buffer, 95.0f);
-    
-    float recommended = (p50 + p75) / 2.0f;
-    
-    cJSON *response = cJSON_CreateObject();
-    cJSON_AddNumberToObject(response, "min", (double)result.min);
-    cJSON_AddNumberToObject(response, "max", (double)result.max);
-    cJSON_AddNumberToObject(response, "avg", (double)result.mean);
-    cJSON_AddNumberToObject(response, "stddev", (double)result.stddev);
-    cJSON_AddNumberToObject(response, "p25", (double)p25);
-    cJSON_AddNumberToObject(response, "p50_median", (double)p50);
-    cJSON_AddNumberToObject(response, "p75", (double)p75);
-    cJSON_AddNumberToObject(response, "p95", (double)p95);
-    cJSON_AddNumberToObject(response, "recommended_threshold", (double)recommended);
-    cJSON_AddNumberToObject(response, "current_threshold", (double)*g_cmd_context->threshold_high);
-    
-    char *json_str = cJSON_PrintUnformatted(response);
-    if (json_str) {
-        mqtt_send_response(g_mqtt_state, json_str, g_response_topic);
-        free(json_str);
-    }
-    cJSON_Delete(response);
-}
-
-static void cmd_persistence(cJSON *root) {
-    int new_timeout;
-    if (get_int_param(root, "value", &new_timeout, PERSISTENCE_MIN, PERSISTENCE_MAX,
-                     "ERROR: Persistence timeout must be between 1 and 30 seconds")) {
-        int old_timeout = g_cmd_context->config->persistence_timeout;
-        g_cmd_context->config->persistence_timeout = new_timeout;
-        
-        char response[128];
-        snprintf(response, sizeof(response), 
-                 "Persistence timeout updated: %d -> %d seconds", old_timeout, new_timeout);
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+    if (hours > 0) {
+        snprintf(buffer, size, "%dh %dm %ds", hours, minutes, seconds);
+    } else if (minutes > 0) {
+        snprintf(buffer, size, "%dm %ds", minutes, seconds);
+    } else {
+        snprintf(buffer, size, "%ds", seconds);
     }
 }
 
-static void cmd_debounce(cJSON *root) {
-    int new_debounce;
-    if (get_int_param(root, "value", &new_debounce, DEBOUNCE_MIN, DEBOUNCE_MAX,
-                     "ERROR: Debounce count must be between 1 and 10")) {
-        uint8_t old_debounce = g_cmd_context->config->debounce_count;
-        g_cmd_context->config->debounce_count = (uint8_t)new_debounce;
-        
-        char response[128];
-        snprintf(response, sizeof(response), 
-                 "Debounce count updated: %d -> %d", old_debounce, new_debounce);
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
-    }
-}
-
-static void cmd_hysteresis(cJSON *root) {
-    float new_ratio;
-    if (get_float_param(root, "value", &new_ratio, HYSTERESIS_MIN, HYSTERESIS_MAX,
-                       "ERROR: Hysteresis ratio must be between 0.1 and 1.0")) {
-        float old_ratio = g_cmd_context->config->hysteresis_ratio;
-        g_cmd_context->config->hysteresis_ratio = new_ratio;
-        *g_cmd_context->threshold_low = *g_cmd_context->threshold_high * new_ratio;
-        
-        char response[256];
-        snprintf(response, sizeof(response), 
-                 "Hysteresis ratio updated: %.2f -> %.2f", old_ratio, new_ratio);
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
-    }
-}
-
-static void cmd_variance_scale(cJSON *root) {
-    float new_scale;
-    if (get_float_param(root, "value", &new_scale, VARIANCE_SCALE_MIN, VARIANCE_SCALE_MAX,
-                       "ERROR: Variance scale must be between 100 and 2000")) {
-        float old_scale = g_cmd_context->config->variance_scale;
-        g_cmd_context->config->variance_scale = new_scale;
-        
-        char response[256];
-        snprintf(response, sizeof(response), 
-                 "Variance scale updated: %.0f -> %.0f (sensitivity %s)", 
-                 old_scale, new_scale,
-                 new_scale < old_scale ? "increased" : "decreased");
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
-    }
-}
-
-// Helper function to check if a feature is selected and get its weight
-static bool is_feature_selected(uint8_t feat_idx, uint8_t num_selected, 
-                                const uint8_t *selected_features, 
-                                const float *weights, float *out_weight) {
-    if (num_selected == 0) return false;
-    for (uint8_t i = 0; i < num_selected; i++) {
-        if (selected_features[i] == feat_idx) {
-            if (out_weight) *out_weight = weights[i];
-            return true;
-        }
-    }
-    return false;
-}
-
-// Helper to add a feature to the response with optional calibration info
-static void add_feature_to_response(cJSON *response, const char *name, uint8_t feat_idx,
-                                    double value, uint8_t num_selected,
-                                    const uint8_t *selected_features, const float *weights) {
-    cJSON *feat_obj = cJSON_CreateObject();
-    cJSON_AddNumberToObject(feat_obj, "value", value);
-
-    float weight;
-    if (is_feature_selected(feat_idx, num_selected, selected_features, weights, &weight)) {
-        // Calibrated mode: show selected feature with calibrated weight
-        cJSON_AddBoolToObject(feat_obj, "selected", true);
-        cJSON_AddNumberToObject(feat_obj, "weight", (double)weight);
-    } else if (g_cmd_context && g_cmd_context->config && feat_idx < 10) {
-        // Default mode: show weight from default configuration
-        float default_weight = g_cmd_context->config->feature_weights[feat_idx];
-        if (default_weight > 0.0f) {
-            cJSON_AddBoolToObject(feat_obj, "selected", true);  // Mark as selected if weight > 0
-            cJSON_AddNumberToObject(feat_obj, "weight", (double)default_weight);
-        }
-    }
-
-    cJSON_AddItemToObject(response, name, feat_obj);
-}
-
-static void cmd_features(cJSON *root) {
+static void cmd_stats(cJSON *root) {
     cJSON *response = cJSON_CreateObject();
     
-    // Get calibration info
-    uint8_t num_selected = calibration_get_num_selected();
-    const uint8_t *selected_features = NULL;
-    const float *weights = NULL;
+    // Timestamp
+    int64_t current_time = esp_timer_get_time() / 1000000;  // Convert to seconds
+    cJSON_AddNumberToObject(response, "timestamp", (double)current_time);
     
-    if (num_selected > 0) {
-        selected_features = calibration_get_selected_features();
-        weights = calibration_get_weights();
+    // Uptime (human-readable)
+    if (g_cmd_context->system_start_time) {
+        int64_t uptime_sec = current_time - (*g_cmd_context->system_start_time);
+        char uptime_str[32];
+        format_uptime(uptime_str, sizeof(uptime_str), uptime_sec);
+        cJSON_AddStringToObject(response, "uptime", uptime_str);
     }
     
-    // Add all features with flat naming
-    add_feature_to_response(response, "time_domain_variance", 0, 
-                           (double)g_cmd_context->current_features->variance,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "time_domain_skewness", 1, 
-                           (double)g_cmd_context->current_features->skewness,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "time_domain_kurtosis", 2, 
-                           (double)g_cmd_context->current_features->kurtosis,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "time_domain_entropy", 3, 
-                           (double)g_cmd_context->current_features->entropy,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "time_domain_iqr", 4, 
-                           (double)g_cmd_context->current_features->iqr,
-                           num_selected, selected_features, weights);
+    // CPU usage percentage
+    TaskStatus_t *task_status_array;
+    uint32_t total_run_time;
+    UBaseType_t task_count = uxTaskGetNumberOfTasks();
     
-    add_feature_to_response(response, "spatial_variance", 5, 
-                           (double)g_cmd_context->current_features->spatial_variance,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "spatial_correlation", 6, 
-                           (double)g_cmd_context->current_features->spatial_correlation,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "spatial_gradient", 7, 
-                           (double)g_cmd_context->current_features->spatial_gradient,
-                           num_selected, selected_features, weights);
+    task_status_array = pvPortMalloc(task_count * sizeof(TaskStatus_t));
+    if (task_status_array != NULL) {
+        task_count = uxTaskGetSystemState(task_status_array, task_count, &total_run_time);
+        
+        // Find IDLE task runtime
+        uint32_t idle_run_time = 0;
+        for (UBaseType_t i = 0; i < task_count; i++) {
+            if (strstr(task_status_array[i].pcTaskName, "IDLE") != NULL) {
+                idle_run_time += task_status_array[i].ulRunTimeCounter;
+            }
+        }
+        
+        // Calculate CPU usage: 100 - (idle_time / total_time * 100)
+        float cpu_usage = 0.0f;
+        if (total_run_time > 0) {
+            cpu_usage = 100.0f - ((float)idle_run_time / (float)total_run_time * 100.0f);
+            if (cpu_usage < 0.0f) cpu_usage = 0.0f;
+            if (cpu_usage > 100.0f) cpu_usage = 100.0f;
+        }
+        
+        cJSON_AddNumberToObject(response, "cpu_usage_percent", (double)cpu_usage);
+        vPortFree(task_status_array);
+    } else {
+        // Fallback if memory allocation fails
+        cJSON_AddNumberToObject(response, "cpu_usage_percent", 0.0);
+    }
     
-    add_feature_to_response(response, "temporal_delta_mean", 8,
-                           (double)g_cmd_context->current_features->temporal_delta_mean,
-                           num_selected, selected_features, weights);
-    add_feature_to_response(response, "temporal_delta_variance", 9,
-                           (double)g_cmd_context->current_features->temporal_delta_variance,
-                           num_selected, selected_features, weights);
+    // Heap usage percentage
+    size_t free_heap = esp_get_free_heap_size();
+    size_t total_heap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    float heap_usage = 0.0f;
+    if (total_heap > 0) {
+        heap_usage = ((float)(total_heap - free_heap) / (float)total_heap) * 100.0f;
+    }
+    cJSON_AddNumberToObject(response, "heap_usage_percent", (double)heap_usage);
+    
+    // Current state
+    const char *state_names[] = {"idle", "motion"};
+    segmentation_state_t state = segmentation_get_state(g_cmd_context->segmentation);
+    cJSON_AddStringToObject(response, "state", state_names[state]);
+    
+    // Current turbulence (last packet)
+    float turbulence = segmentation_get_last_turbulence(g_cmd_context->segmentation);
+    cJSON_AddNumberToObject(response, "turbulence", (double)turbulence);
+    
+    // Moving variance
+    float moving_variance = segmentation_get_moving_variance(g_cmd_context->segmentation);
+    cJSON_AddNumberToObject(response, "movement", (double)moving_variance);
+    
+    // Adaptive threshold
+    float adaptive_threshold = segmentation_get_threshold(g_cmd_context->segmentation);
+    cJSON_AddNumberToObject(response, "threshold", (double)adaptive_threshold);
+    
+    // Packets processed
+    uint32_t packets_processed = segmentation_get_total_packets(g_cmd_context->segmentation);
+    cJSON_AddNumberToObject(response, "packets_processed", packets_processed);
+    
     
     char *json_str = cJSON_PrintUnformatted(response);
     if (json_str) {
@@ -457,8 +435,7 @@ static void cmd_hampel_filter(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
@@ -475,8 +452,7 @@ static void cmd_hampel_threshold(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
@@ -490,8 +466,7 @@ static void cmd_savgol_filter(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
@@ -505,8 +480,7 @@ static void cmd_butterworth_filter(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
@@ -520,198 +494,10 @@ static void cmd_smart_publishing(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
-static void cmd_calibrate(cJSON *root) {
-    cJSON *action = cJSON_GetObjectItem(root, "action");
-    if (!action || !cJSON_IsString(action)) {
-        send_response("ERROR: Missing or invalid 'action' field");
-        return;
-    }
-    
-    const char *action_str = action->valuestring;
-    
-    if (strcmp(action_str, "start") == 0) {
-        int samples = DEFAULT_CALIBRATION_SAMPLES;
-        cJSON *samples_obj = cJSON_GetObjectItem(root, "samples");
-        if (samples_obj && cJSON_IsNumber(samples_obj)) {
-            samples = (int)samples_obj->valueint;
-        }
-        
-        if (calibration_start(samples, g_cmd_context->config, g_cmd_context->normalizer)) {
-            char response[128];
-            snprintf(response, sizeof(response), 
-                     "Calibration started (%d samples per phase)", samples);
-            send_response(response);
-        } else {
-            send_response("ERROR: Failed to start calibration (already in progress?)");
-        }
-        
-    } else if (strcmp(action_str, "stop") == 0) {
-        calibration_stop(g_cmd_context->config);
-        send_response("Calibration stopped");
-        
-    } else if (strcmp(action_str, "status") == 0) {
-        cJSON *response = cJSON_CreateObject();
-        
-        calibration_phase_t phase = calibration_get_phase();
-        const char *phase_names[] = {"IDLE", "BASELINE", "MOVEMENT", "ANALYZING"};
-        cJSON_AddStringToObject(response, "phase", phase_names[phase]);
-        cJSON_AddBoolToObject(response, "active", calibration_is_active());
-        
-        // Add sample information for all active phases
-        if (calibration_is_active()) {
-            calibration_state_t calib_state;
-            calibration_get_results(&calib_state);
-            
-            uint32_t samples_collected = calibration_get_samples_collected();
-            uint32_t samples_target = calib_state.phase_target_samples;
-            uint32_t traffic_rate = calib_state.traffic_rate;
-            
-            cJSON_AddNumberToObject(response, "samples_collected", (double)samples_collected);
-            cJSON_AddNumberToObject(response, "samples_target", (double)samples_target);
-            
-            // Calculate estimated time remaining
-            if (traffic_rate > 0 && samples_target > samples_collected) {
-                uint32_t samples_remaining = samples_target - samples_collected;
-                uint32_t estimated_sec = samples_remaining / traffic_rate;
-                cJSON_AddNumberToObject(response, "estimated_time_remaining_sec", (double)estimated_sec);
-            }
-        }
-        
-        if (calibration_get_num_selected() > 0) {
-            cJSON_AddNumberToObject(response, "num_selected", calibration_get_num_selected());
-            cJSON_AddNumberToObject(response, "optimal_threshold", (double)calibration_get_threshold());
-            
-            // Add recommended filter configuration
-            bool butterworth, wavelet, hampel, savgol, adaptive_norm;
-            int wavelet_level;
-            float wavelet_threshold, hampel_threshold, norm_alpha;
-            calibration_get_filter_config(&butterworth, &wavelet, &wavelet_level, &wavelet_threshold,
-                                         &hampel, &hampel_threshold, &savgol, &adaptive_norm, &norm_alpha);
-            
-            cJSON *filter_config = cJSON_CreateObject();
-            cJSON_AddBoolToObject(filter_config, "butterworth_enabled", butterworth);
-            cJSON_AddBoolToObject(filter_config, "wavelet_enabled", wavelet);
-            cJSON_AddNumberToObject(filter_config, "wavelet_level", wavelet_level);
-            cJSON_AddNumberToObject(filter_config, "wavelet_threshold", (double)wavelet_threshold);
-            cJSON_AddBoolToObject(filter_config, "hampel_enabled", hampel);
-            cJSON_AddNumberToObject(filter_config, "hampel_threshold", (double)hampel_threshold);
-            cJSON_AddBoolToObject(filter_config, "savgol_enabled", savgol);
-            cJSON_AddBoolToObject(filter_config, "adaptive_normalizer_enabled", adaptive_norm);
-            cJSON_AddNumberToObject(filter_config, "adaptive_normalizer_alpha", (double)norm_alpha);
-            cJSON_AddItemToObject(response, "filter_config", filter_config);
-        }
-        
-        char *json_str = cJSON_PrintUnformatted(response);
-        if (json_str) {
-            mqtt_send_response(g_mqtt_state, json_str, g_response_topic);
-            free(json_str);
-        }
-        cJSON_Delete(response);
-        
-    } else {
-        char response[128];
-        snprintf(response, sizeof(response), 
-                 "ERROR: Unknown calibration action '%s' (use: start, stop, status)", action_str);
-        send_response(response);
-    }
-}
-
-static void cmd_adaptive_normalizer(cJSON *root) {
-    bool enabled;
-    if (get_bool_param(root, "enabled", &enabled)) {
-        g_cmd_context->config->adaptive_normalizer_enabled = enabled;
-        char response[64];
-        snprintf(response, sizeof(response), "Adaptive normalizer %s", 
-                 enabled ? "enabled" : "disabled");
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
-    }
-}
-
-static void cmd_adaptive_normalizer_alpha(cJSON *root) {
-    float new_alpha;
-    if (get_float_param(root, "value", &new_alpha, ALPHA_MIN, ALPHA_MAX,
-                       "ERROR: Alpha must be between 0.001 and 0.1")) {
-        float old_alpha = g_cmd_context->config->adaptive_normalizer_alpha;
-        g_cmd_context->config->adaptive_normalizer_alpha = new_alpha;
-        
-        // Reinitialize normalizer with new alpha
-        adaptive_normalizer_init(g_cmd_context->normalizer, new_alpha);
-        
-        char response[256];
-        snprintf(response, sizeof(response), 
-                 "Adaptive normalizer alpha updated: %.4f -> %.4f (learning rate %s)", 
-                 old_alpha, new_alpha,
-                 new_alpha > old_alpha ? "increased" : "decreased");
-        send_response(response);
-        ESP_LOGI(TAG, "%s", response);
-        
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
-    }
-}
-
-static void cmd_adaptive_normalizer_reset_timeout(cJSON *root) {
-    cJSON *value = cJSON_GetObjectItem(root, "value");
-    if (value && cJSON_IsNumber(value)) {
-        uint32_t new_timeout = (uint32_t)value->valueint;
-        if (new_timeout <= RESET_TIMEOUT_MAX) {
-            uint32_t old_timeout = g_cmd_context->config->adaptive_normalizer_reset_timeout_sec;
-            g_cmd_context->config->adaptive_normalizer_reset_timeout_sec = new_timeout;
-            
-            char response[256];
-            if (new_timeout == 0) {
-                snprintf(response, sizeof(response), 
-                         "Adaptive normalizer auto-reset disabled (was %lu sec)", 
-                         (unsigned long)old_timeout);
-            } else {
-                snprintf(response, sizeof(response), 
-                         "Adaptive normalizer reset timeout updated: %lu -> %lu seconds", 
-                         (unsigned long)old_timeout, (unsigned long)new_timeout);
-            }
-            send_response(response);
-            ESP_LOGI(TAG, "%s", response);
-            
-            config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                             *g_cmd_context->threshold_low);
-        } else {
-            send_response("ERROR: Reset timeout must be between 0 and 300 seconds (0 = disabled)");
-        }
-    } else {
-        send_response("ERROR: Missing or invalid 'value' field");
-    }
-}
-
-static void cmd_adaptive_normalizer_stats(cJSON *root) {
-    cJSON *response = cJSON_CreateObject();
-    
-    cJSON_AddBoolToObject(response, "enabled", g_cmd_context->config->adaptive_normalizer_enabled);
-    cJSON_AddNumberToObject(response, "alpha", (double)g_cmd_context->config->adaptive_normalizer_alpha);
-    cJSON_AddNumberToObject(response, "reset_timeout_sec", g_cmd_context->config->adaptive_normalizer_reset_timeout_sec);
-    
-    // Get current normalizer statistics
-    float mean, variance;
-    adaptive_normalizer_get_stats(g_cmd_context->normalizer, &mean, &variance);
-    
-    cJSON_AddNumberToObject(response, "current_mean", (double)mean);
-    cJSON_AddNumberToObject(response, "current_variance", (double)variance);
-    cJSON_AddNumberToObject(response, "current_stddev", (double)sqrtf(variance));
-    
-    char *json_str = cJSON_PrintUnformatted(response);
-    if (json_str) {
-        mqtt_send_response(g_mqtt_state, json_str, g_response_topic);
-        free(json_str);
-    }
-    cJSON_Delete(response);
-}
 
 static void cmd_traffic_generator_rate(cJSON *root) {
     cJSON *value = cJSON_GetObjectItem(root, "value");
@@ -751,8 +537,7 @@ static void cmd_traffic_generator_rate(cJSON *root) {
             }
             send_response(response);
             
-            config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                             *g_cmd_context->threshold_low);
+            config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
         } else {
             send_response("ERROR: Rate must be 0-50 packets/sec (0=disabled, recommended: 15)");
         }
@@ -771,8 +556,7 @@ static void cmd_wavelet_filter(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
@@ -791,8 +575,7 @@ static void cmd_wavelet_level(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
 }
 
@@ -811,9 +594,68 @@ static void cmd_wavelet_threshold(cJSON *root) {
         send_response(response);
         ESP_LOGI(TAG, "%s", response);
         
-        config_save_to_nvs(g_cmd_context->config, *g_cmd_context->threshold_high, 
-                         *g_cmd_context->threshold_low);
+        config_save_to_nvs(g_cmd_context->config, g_cmd_context->segmentation->adaptive_threshold);
     }
+}
+
+static void cmd_subcarrier_selection(cJSON *root) {
+    cJSON *indices = cJSON_GetObjectItem(root, "indices");
+    if (!indices || !cJSON_IsArray(indices)) {
+        send_response("ERROR: Missing or invalid 'indices' array");
+        return;
+    }
+    
+    int array_size = cJSON_GetArraySize(indices);
+    if (array_size < 1 || array_size > 64) {
+        send_response("ERROR: Number of subcarriers must be between 1 and 64");
+        return;
+    }
+    
+    // Temporary array to validate indices
+    uint8_t temp_subcarriers[64];
+    
+    // Extract and validate indices
+    for (int i = 0; i < array_size; i++) {
+        cJSON *item = cJSON_GetArrayItem(indices, i);
+        if (!cJSON_IsNumber(item)) {
+            send_response("ERROR: All indices must be numbers");
+            return;
+        }
+        
+        int value = item->valueint;
+        if (value < 0 || value > 63) {
+            char error_msg[128];
+            snprintf(error_msg, sizeof(error_msg), 
+                     "ERROR: Subcarrier index %d out of range (must be 0-63)", value);
+            send_response(error_msg);
+            return;
+        }
+        
+        temp_subcarriers[i] = (uint8_t)value;
+    }
+    
+    // Update configuration
+    memcpy(g_cmd_context->config->selected_subcarriers, temp_subcarriers, 
+           array_size * sizeof(uint8_t));
+    g_cmd_context->config->num_selected_subcarriers = (uint8_t)array_size;
+    
+    // Update CSI processor
+    csi_set_subcarrier_selection(temp_subcarriers, (uint8_t)array_size);
+    
+    // Save to NVS
+    esp_err_t err = config_save_to_nvs(g_cmd_context->config, 
+                                       segmentation_get_threshold(g_cmd_context->segmentation));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "💾 Subcarrier selection saved to NVS");
+    } else {
+        ESP_LOGE(TAG, "❌ Failed to save subcarrier selection to NVS: %s", esp_err_to_name(err));
+    }
+    
+    char response[256];
+    snprintf(response, sizeof(response), 
+             "Subcarrier selection updated: %d subcarriers", array_size);
+    send_response(response);
+    ESP_LOGI(TAG, "%s", response);
 }
 
 static void cmd_factory_reset(cJSON *root) {
@@ -823,13 +665,185 @@ static void cmd_factory_reset(cJSON *root) {
     
     // Reset config to defaults
     config_init_defaults(g_cmd_context->config);
-    *g_cmd_context->threshold_high = DEFAULT_THRESHOLD;
-    *g_cmd_context->threshold_low = DEFAULT_THRESHOLD * g_cmd_context->config->hysteresis_ratio;
     
-    calibration_init();
+    // Reset segmentation to defaults
+    segmentation_init(g_cmd_context->segmentation);
+    ESP_LOGI(TAG, "📍 Segmentation reset to defaults (threshold: %.2f)", SEGMENTATION_DEFAULT_THRESHOLD);
     
-    send_response("✅ Factory reset complete - all settings restored to defaults");
-    ESP_LOGI(TAG, "✅ Factory reset complete");
+    // Reset subcarrier selection to defaults
+    csi_set_subcarrier_selection(g_cmd_context->config->selected_subcarriers,
+                                 g_cmd_context->config->num_selected_subcarriers);
+    ESP_LOGI(TAG, "📡 Subcarrier selection reset to defaults (%d subcarriers)", 
+             g_cmd_context->config->num_selected_subcarriers);
+    
+    send_response("Factory reset complete");
+    ESP_LOGI(TAG, "Factory reset complete");
+}
+
+// CSI raw capture state
+typedef struct {
+    bool active;
+    uint32_t max_packets;
+    uint32_t collected_packets;
+    uint8_t batch_buffer[4 + (10 * 128)];  // Header (4 bytes) + 10 packets (128 bytes each)
+    uint8_t batch_count;
+    uint16_t batch_index;
+} csi_raw_capture_t;
+
+static csi_raw_capture_t g_csi_capture = {0};
+
+static void cmd_csi_raw_capture(cJSON *root) {
+    cJSON *action = cJSON_GetObjectItem(root, "action");
+    if (!action || !cJSON_IsString(action)) {
+        send_response("ERROR: Missing 'action' field (start/stop)");
+        return;
+    }
+    
+    const char *action_str = action->valuestring;
+    
+    if (strcmp(action_str, "start") == 0) {
+        // Get max_packets parameter (default: 1000)
+        cJSON *max_packets = cJSON_GetObjectItem(root, "max_packets");
+        uint32_t target = 1000;
+        if (max_packets && cJSON_IsNumber(max_packets)) {
+            target = (uint32_t)max_packets->valueint;
+            if (target < 10 || target > 10000) {
+                send_response("ERROR: max_packets must be between 10 and 10000");
+                return;
+            }
+        }
+        
+        // Initialize capture
+        g_csi_capture.active = true;
+        g_csi_capture.max_packets = target;
+        g_csi_capture.collected_packets = 0;
+        g_csi_capture.batch_count = 0;
+        g_csi_capture.batch_index = 0;
+        
+        char response[128];
+        snprintf(response, sizeof(response), 
+                 "CSI raw capture started (target: %u packets)", (unsigned int)target);
+        send_response(response);
+        ESP_LOGI(TAG, "📊 %s", response);
+        
+    } else if (strcmp(action_str, "stop") == 0) {
+        if (!g_csi_capture.active) {
+            send_response("CSI raw capture not active");
+            return;
+        }
+        
+        // Flush remaining packets in batch
+        if (g_csi_capture.batch_count > 0) {
+            // Write header (little-endian)
+            g_csi_capture.batch_buffer[0] = (uint8_t)(g_csi_capture.batch_count & 0xFF);
+            g_csi_capture.batch_buffer[1] = (uint8_t)((g_csi_capture.batch_count >> 8) & 0xFF);
+            g_csi_capture.batch_buffer[2] = (uint8_t)(g_csi_capture.batch_index & 0xFF);
+            g_csi_capture.batch_buffer[3] = (uint8_t)((g_csi_capture.batch_index >> 8) & 0xFF);
+            
+            // Publish batch
+            size_t payload_size = 4 + (g_csi_capture.batch_count * 128);
+            char topic[128];
+            snprintf(topic, sizeof(topic), "%s/csi_raw", g_cmd_context->mqtt_base_topic);
+            mqtt_publish_binary(g_mqtt_state, topic, g_csi_capture.batch_buffer, payload_size);
+        }
+        
+        g_csi_capture.active = false;
+        
+        char response[128];
+        snprintf(response, sizeof(response), 
+                 "CSI raw capture stopped (collected: %u packets)", 
+                 (unsigned int)g_csi_capture.collected_packets);
+        send_response(response);
+        ESP_LOGI(TAG, "📊 %s", response);
+        
+    } else {
+        send_response("ERROR: Invalid action (must be 'start' or 'stop')");
+    }
+}
+
+// Function to be called from csi_callback to capture raw packets
+void mqtt_commands_capture_csi_packet(const int8_t *csi_data, size_t csi_len) {
+    if (!g_csi_capture.active || csi_len != 128) {
+        return;
+    }
+    
+    // Check if we've reached the target
+    if (g_csi_capture.collected_packets >= g_csi_capture.max_packets) {
+        g_csi_capture.active = false;
+        return;
+    }
+    
+    // Copy packet to batch buffer
+    size_t offset = 4 + (g_csi_capture.batch_count * 128);
+    memcpy(&g_csi_capture.batch_buffer[offset], csi_data, 128);
+    g_csi_capture.batch_count++;
+    g_csi_capture.collected_packets++;
+    
+    // When batch is full (10 packets) or we've reached the target, publish
+    if (g_csi_capture.batch_count == 10 || 
+        g_csi_capture.collected_packets >= g_csi_capture.max_packets) {
+        
+        // Create JSON message with base64-encoded data
+        cJSON *root = cJSON_CreateObject();
+        if (root) {
+            cJSON_AddNumberToObject(root, "packet_count", g_csi_capture.batch_count);
+            cJSON_AddNumberToObject(root, "batch_index", g_csi_capture.batch_index);
+            
+            // Base64 encode the CSI data
+            size_t data_len = g_csi_capture.batch_count * 128;
+            size_t base64_len = ((data_len + 2) / 3) * 4 + 1;
+            char *base64_data = malloc(base64_len);
+            
+            if (base64_data) {
+                // Simple base64 encoding
+                const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                size_t i, j;
+                for (i = 0, j = 0; i < data_len; i += 3, j += 4) {
+                    uint32_t n = ((uint32_t)g_csi_capture.batch_buffer[4 + i] << 16) |
+                                 ((i + 1 < data_len) ? ((uint32_t)g_csi_capture.batch_buffer[4 + i + 1] << 8) : 0) |
+                                 ((i + 2 < data_len) ? (uint32_t)g_csi_capture.batch_buffer[4 + i + 2] : 0);
+                    
+                    base64_data[j] = base64_chars[(n >> 18) & 0x3F];
+                    base64_data[j + 1] = base64_chars[(n >> 12) & 0x3F];
+                    base64_data[j + 2] = (i + 1 < data_len) ? base64_chars[(n >> 6) & 0x3F] : '=';
+                    base64_data[j + 3] = (i + 2 < data_len) ? base64_chars[n & 0x3F] : '=';
+                }
+                base64_data[j] = '\0';
+                
+                cJSON_AddStringToObject(root, "data", base64_data);
+                free(base64_data);
+                
+                // Publish JSON
+                char *json_str = cJSON_PrintUnformatted(root);
+                if (json_str) {
+                    char topic[128];
+                    snprintf(topic, sizeof(topic), "%s/csi_raw", g_cmd_context->mqtt_base_topic);
+                    mqtt_send_response(g_mqtt_state, json_str, topic);
+                    free(json_str);
+                }
+            }
+            
+            cJSON_Delete(root);
+        }
+        
+        // Reset batch
+        g_csi_capture.batch_count = 0;
+        g_csi_capture.batch_index++;
+        
+        // Log progress every 100 packets
+        if (g_csi_capture.collected_packets % 100 == 0) {
+            ESP_LOGI(TAG, "📊 CSI capture progress: %u/%u packets", 
+                     (unsigned int)g_csi_capture.collected_packets,
+                     (unsigned int)g_csi_capture.max_packets);
+        }
+    }
+    
+    // Auto-stop when target reached
+    if (g_csi_capture.collected_packets >= g_csi_capture.max_packets) {
+        g_csi_capture.active = false;
+        ESP_LOGI(TAG, "📊 CSI capture complete: %u packets collected", 
+                 (unsigned int)g_csi_capture.collected_packets);
+    }
 }
 
 // Command dispatch table
@@ -841,16 +855,15 @@ typedef struct {
 } command_entry_t;
 
 static const command_entry_t command_table[] = {
-    {"threshold", cmd_threshold},
-    {"stats", cmd_stats},
+    {"segmentation_threshold", cmd_segmentation_threshold},
+    {"segmentation_k_factor", cmd_segmentation_k_factor},
+    {"segmentation_window_size", cmd_segmentation_window_size},
+    {"segmentation_min_length", cmd_segmentation_min_length},
+    {"segmentation_max_length", cmd_segmentation_max_length},
+    {"subcarrier_selection", cmd_subcarrier_selection},
+    {"features_enable", cmd_features_enable},
     {"info", cmd_info},
-    {"logs", cmd_logs},
-    {"analyze", cmd_analyze},
-    {"persistence", cmd_persistence},
-    {"debounce", cmd_debounce},
-    {"hysteresis", cmd_hysteresis},
-    {"variance_scale", cmd_variance_scale},
-    {"features", cmd_features},
+    {"stats", cmd_stats},
     {"hampel_filter", cmd_hampel_filter},
     {"hampel_threshold", cmd_hampel_threshold},
     {"savgol_filter", cmd_savgol_filter},
@@ -859,13 +872,9 @@ static const command_entry_t command_table[] = {
     {"wavelet_level", cmd_wavelet_level},
     {"wavelet_threshold", cmd_wavelet_threshold},
     {"smart_publishing", cmd_smart_publishing},
-    {"calibrate", cmd_calibrate},
-    {"adaptive_normalizer", cmd_adaptive_normalizer},
-    {"adaptive_normalizer_alpha", cmd_adaptive_normalizer_alpha},
-    {"adaptive_normalizer_reset_timeout", cmd_adaptive_normalizer_reset_timeout},
-    {"adaptive_normalizer_stats", cmd_adaptive_normalizer_stats},
     {"traffic_generator_rate", cmd_traffic_generator_rate},
     {"factory_reset", cmd_factory_reset},
+    {"csi_raw_capture", cmd_csi_raw_capture},
     {NULL, NULL}
 };
 

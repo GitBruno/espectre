@@ -3,6 +3,4 @@ dependencies:
   ## Required IDF version
   idf:
     version: '>=6.1.0'
-  ## Component dependencies
-  espressif/cjson: ^1
-  espressif/mqtt: ^1 
+  espressif/esp-dsp: "^1.4.0"

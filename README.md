@@ -1,14 +1,16 @@
-![License](https://img.shields.io/badge/license-GPLv3-blue.svg)
-![C](https://img.shields.io/badge/C-ESP--IDF-orange.svg)
-![Platform](https://img.shields.io/badge/platform-ESP32--S3-red.svg)
-![Status](https://img.shields.io/badge/status-experimental-orange.svg)
+[![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](https://github.com/francescopace/espectre/blob/main/LICENSE)
+[![C](https://img.shields.io/badge/C-ESP--IDF-orange.svg)](https://github.com/espressif/esp-idf)
+[![Platform](https://img.shields.io/badge/platform-ESP32--S3%20%7C%20ESP32--C6-red.svg)](https://www.espressif.com/en/products/socs)
+[![Status](https://img.shields.io/badge/status-experimental-orange.svg)](https://github.com/francescopace/espectre)
+[![Changelog](https://img.shields.io/badge/changelog-v1.2.0-blue.svg)](https://github.com/francescopace/espectre/blob/main/CHANGELOG.md)
 
 # 🛜 ESPectre 👻
 
 **Motion detection system based on Wi-Fi spectre analysis (CSI), with Home Assistant integration.**
 
-**⚠️ Disclaimer**: This is an experimental project for educational and research purposes. The author assumes no responsibility for misuse or damage resulting from the use of this system. Use responsibly and in compliance with applicable laws.
+**📰 Featured Article**: Read the complete story behind ESPectre on Medium **[🇮🇹 Italian](https://medium.com/@francesco.pace/come-ho-trasformato-il-mio-wi-fi-in-un-sensore-di-movimento-40053fd83128?source=friends_link&sk=46d9cfa026790ae807ecc291ac5eac67&utm_source=github&utm_medium=readme&utm_campaign=espectre)**, **[🇬🇧 English](https://medium.com/@francesco.pace/how-i-turned-my-wi-fi-into-a-motion-sensor-61a631a9b4ec?sk=c7f79130d78b0545fce4a228a6a79af3&utm_source=github&utm_medium=readme&utm_campaign=espectre)**
 
+**⚠️ Disclaimer**: This is an experimental project for educational and research purposes. The author assumes no responsibility for misuse or damage resulting from the use of this system. Use responsibly and in compliance with applicable laws.
 
 ---
 
@@ -27,6 +29,7 @@
 - [Technical Deep Dive](#-technical-deep-dive)
 - [Future Evolutions](#-future-evolutions-ai-approach)
 - [References](#-references)
+- [Changelog](#-changelog)
 - [License](#-license)
 - [Author](#-author)
 
@@ -34,8 +37,8 @@
 
 ## 🎯 In 3 Points
 
-1. **What it does**: Detects movement at home using Wi-Fi (no cameras, no microphones)
-2. **What you need**: A ~€10 device (ESP32-S3) + Home Assistant or MQTT server + ESP-IDF development tools
+1. **What it does**: Detects movement using Wi-Fi (no cameras, no microphones)
+2. **What you need**: A ~€10 device (ESP32-S3 or ESP32-C6) + Home Assistant or MQTT server
 3. **Setup time**: 30-45 minutes (first time, including ESP-IDF setup)
 
 ---
@@ -48,7 +51,7 @@
 
 - ✅ **No ML training required**: Works out-of-the-box with mathematical algorithms
 - ✅ **10 extracted features**: Statistical, spatial, and temporal features
-- ✅ **Real-time processing**: Low latency detection on ESP32-S3 hardware
+- ✅ **Real-time processing**: Low latency detection on ESP32 hardware (S3/C6)
 - ✅ **Foundation for ML**: These features can serve as the basis for collecting labeled datasets to train ML models for advanced tasks (people counting, activity recognition, gesture detection)
 
 The mathematical approach provides excellent movement detection without the complexity of ML model training, while the extracted features offer a solid foundation for future ML-based enhancements.
@@ -57,13 +60,15 @@ The mathematical approach provides excellent movement detection without the comp
 
 ## 🛒 What You Need
 
-### Hardware (Total: ~€10)
+### Hardware
 
-- ✅ **2.4GHz Wi-Fi Router** (the one you already have at home works fine)
-- ✅ **ESP32-S3 DevKit bundle with external antennas** (~€10) - Available on Amazon, AliExpress, or electronics stores
+- ✅ **2.4GHz Wi-Fi Router** - the one you already have at home works fine
+- ✅ **ESP32-S3 or ESP32-C6** - Available on Amazon, AliExpress, or electronics stores
+
+📖 See [ESP32-PLATFORM-SUPPORT.md](ESP32-PLATFORM-SUPPORT.md) for detailed platform comparison and recommendations
 
 ![3 x ESP32-S3 DevKit bundle with external antennas](images/home_lab.jpg)
-*ESP32-S3 DevKit with external antennas (recommended for better reception)*
+*ESP32-S3 DevKit with external antennas*
 
 ### Software (All Free)
 
@@ -76,7 +81,6 @@ The mathematical approach provides excellent movement detection without the comp
 
 - ✅ **Basic command line knowledge** required for building and flashing firmware
 - ❌ **NO** router configuration needed
-- ✅ Follow the setup guide in SETUP.md
 
 ---
 
@@ -88,13 +92,20 @@ The mathematical approach provides excellent movement detection without the comp
 1. **Setup & Installation**: Follow the complete guide in [SETUP.md](SETUP.md)
 2. **Calibration & Tuning**: Optimize for your environment with [CALIBRATION.md](CALIBRATION.md)
 
+### Web-Based Monitor
+
+ESPectre includes a web-based monitoring interface (`espectre-monitor.html`) for real-time visualization and configuration without command line tools.
+
+![Web Monitor Interface](images/web_monitor_chart.png)
+*Real-time CSI monitoring and configuration interface*
+
 ---
 
 ## 📖 How It Works (Simple Version)
 
 When someone moves in a room, they "disturb" the Wi-Fi waves traveling between the router and the sensor. It's like when you move your hand in front of a flashlight and see the shadow change.
 
-The ESP32-S3 device "listens" to these changes and understands if there's movement.
+The ESP32 device "listens" to these changes and understands if there's movement.
 
 ### Advantages
 
@@ -176,11 +187,63 @@ Optimal sensor placement is crucial for reliable movement detection.
 
 ## ⚙️ System Architecture
 
+### Processing Pipeline
+
+ESPectre uses a streamlined processing pipeline:
+
+```
+┌─────────────┐
+│  CSI Data   │  Raw Wi-Fi Channel State Information
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│Segmentation │  Moving Variance Segmentation (MVS)
+│  (2-state)  │  IDLE ↔ MOTION (operates on RAW CSI)
+└──────┬──────┘
+       │
+       ├─────────────────────┐
+       │                     │
+       ▼                     ▼
+┌─────────────┐      ┌──────────────┐
+│    IDLE     │      │    MOTION    │
+│  (no feat.) │      │  (optional   │
+│             │      │   features)  │
+└─────────────┘      └──────┬───────┘
+                            │
+                            ▼
+                     ┌─────────────┐
+                     │   Filters   │  Butterworth, Wavelet,
+                     │             │  Hampel, Savitzky-Golay
+                     │             │  (applied to features only)
+                     └──────┬──────┘
+                            │
+                            ▼
+                     ┌─────────────┐
+                     │  Features   │  10 mathematical features
+                     │ (if enabled)│  (filtered CSI data)
+                     └──────┬──────┘
+                            │
+       ┌────────────────────┴────────────────────┐
+       │                                         │
+       ▼                                         ▼
+┌─────────────┐                          ┌─────────────┐
+│    MQTT     │  Publish state + metrics │    MQTT     │
+│   (IDLE)    │                          │  (MOTION)   │
+└─────────────┘                          └─────────────┘
+```
+
+**Key Points:**
+- **2-state system**: IDLE or MOTION (no intermediate states)
+- **Segmentation-based**: Uses Moving Variance Segmentation (MVS) on **raw CSI data**
+- **Filters applied to features only**: Segmentation uses unfiltered data to preserve motion sensitivity
+- **Optional features**: Feature extraction when enabled (configurable)
+
 ### Single or Multiple Sensors
 
 ```
 ┌─────────┐  ┌─────────┐  ┌─────────┐
-│ESP32-S3 │  │ESP32-S3 │  │ESP32-S3 │
+│ ESP32   │  │ ESP32   │  │ ESP32   │
 │ Room 1  │  │ Room 2  │  │ Room 3  │
 └────┬────┘  └────┬────┘  └────┬────┘
      │            │            │
@@ -229,7 +292,7 @@ A: Basic command line skills are needed to build and flash the firmware using ES
 A: Yes, if your router has 2.4GHz Wi-Fi (virtually all modern routers have it).
 
 **Q: How much does it cost in total?**  
-A: Hardware: ~€10 for the ESP32-S3 device. Software: All free and open source. You'll also need a device to run the MQTT broker (Home Assistant or Mosquitto), which can be a Raspberry Pi (~€35-50) or any existing PC/NAS you already have (free).
+A: Hardware: ~€10 for an ESP32-S3 or ESP32-C6 device. Software: All free and open source. You'll also need a device to run the MQTT broker (Home Assistant or Mosquitto), which can be a Raspberry Pi (~€35-50) or any existing PC/NAS you already have (free).
 
 **Q: Do I need to modify anything on the router?**  
 A: No! The router works normally. The sensor "listens" to Wi-Fi signals without modifying anything.
@@ -244,7 +307,7 @@ A: Yes, the 2.4GHz Wi-Fi signal penetrates drywall. Reinforced concrete walls re
 A: It depends on size. One sensor can monitor ~50 m². For larger homes, use multiple sensors (1 sensor every 50-70 m² for optimal coverage).
 
 **Q: Can it distinguish between people and pets?**  
-A: The system uses a 2-state detection model (IDLE/DETECTED) that identifies generic movement without distinguishing between people, pets, or other moving objects. For more sophisticated classification (people vs pets, activity recognition, gesture detection), trained AI/ML models would be required (see Future Evolutions section).
+A: The system uses a 2-state segmentation model (IDLE/MOTION) that identifies generic movement without distinguishing between people, pets, or other moving objects. For more sophisticated classification (people vs pets, activity recognition, gesture detection), trained AI/ML models would be required (see Future Evolutions section).
 
 **Q: Does it consume a lot of Wi-Fi bandwidth?**  
 A: No, MQTT traffic is minimal. With smart publishing disabled (default), the system publishes all detection updates. When smart publishing is enabled, the system only sends data on significant changes or every 5 seconds as a heartbeat, resulting in ~0.2-0.5 KB/s per sensor during idle periods and up to ~1 KB/s during active movement. Network impact is negligible.
@@ -256,7 +319,7 @@ A: Yes, it works normally. Make sure the ESP32 connects to the 2.4 GHz band.
 A: No, Home Assistant can run on Raspberry Pi, NAS, or cloud. Alternatively, just an MQTT broker (Mosquitto) on any device is sufficient.
 
 **Q: How accurate is the detection?**  
-A: Detection accuracy is highly environment-dependent and requires proper calibration. Factors affecting performance include: room layout, wall materials, furniture placement, distance from router (optimal: 3-8m), and interference levels. In optimal conditions with proper calibration, the system provides reliable movement detection. Use the built-in calibration tools (MQTT commands: `analyze`, `threshold`) to tune parameters for your specific environment.
+A: Detection accuracy is highly environment-dependent and requires proper tuning. Factors affecting performance include: room layout, wall materials, furniture placement, distance from router (optimal: 3-8m), and interference levels. In optimal conditions with proper tuning, the system provides reliable movement detection. Adjust the `segmentation_threshold` parameter to tune sensitivity for your specific environment.
 
 **Q: What's the power consumption?**  
 A: ~500mW typical during continuous operation. The firmware includes support for power optimization, and deep sleep modes can be implemented for battery-powered deployments, though this would require custom modifications to the code.
@@ -314,71 +377,80 @@ CSI data represents only the properties of the transmission medium and does not 
 
 ## � Technical Deep Dive
 
+![Segmentation Analysis](images/segmentation_analysis_esp32_c6.png)
+*Moving Variance Segmentation (MVS) analysis: baseline graphs (top) show quiet state, while bottom graphs show motion detection with turbulence signal, adaptive threshold, and state transitions*
+
+<details>
+<summary>🔧 Multi-Platform Support (click to expand)</summary>
+
+ESPectre supports multiple ESP32 platforms with optimized configurations:
+
+- **ESP32-S3**: Fully tested, dual-core, 8MB PSRAM, WiFi 4
+- **ESP32-C6**: Fully tested, single-core RISC-V, WiFi 6
+
+Each platform has specific characteristics, advantages, and configuration requirements.
+
+📖 **For detailed platform comparison, migration guides, and recommendations**, see [ESP32-PLATFORM-SUPPORT.md](ESP32-PLATFORM-SUPPORT.md)
+
+</details>
+
 <details>
 <summary>🔬 Signal Processing Pipeline (click to expand)</summary>
 
 ### Data Flow
 
-#### 1️⃣ **CSI Acquisition** (ESP32-S3)
+#### 1️⃣ **CSI Acquisition** (ESP32)
 - **Native ESP32 CSI API** captures Wi-Fi Channel State Information via callback
 - Extracts amplitude and phase data from OFDM subcarriers (up to 64 subcarriers)
 - Typical capture rate: ~10-100 packets/second depending on Wi-Fi traffic
 
-#### 2️⃣ **Signal Processing** (ESP32-S3)
-The `espectre.c` firmware applies an advanced multi-stage processing pipeline:
+#### 2️⃣ **Motion Segmentation** (ESP32)
+- **Spatial turbulence calculation**: Standard deviation of subcarrier amplitudes (raw CSI data)
+- **Moving Variance Segmentation (MVS)**: Real-time motion segment extraction
+- **Adaptive threshold**: Based on moving variance of turbulence signal
+- **Segment features**: Duration, average turbulence, maximum turbulence
+- **Circular buffer**: Maintains up to 10 recent segments for analysis
+- **Foundation for ML**: Segments can be labeled and used for activity classification
 
-**Stage 1: Advanced Filters** (Configurable via MQTT)
+**Note**: Segmentation operates on **raw, unfiltered CSI data** to preserve motion sensitivity. Filters are not applied to the turbulence signal used for segmentation.
+
+#### 3️⃣ **Optional Signal Processing Filters** (ESP32)
+Advanced filters applied to CSI data **before feature extraction** (configurable via MQTT):
 - **Butterworth Low-Pass**: Removes high-frequency noise >8Hz (environmental interference) - Enabled by default
-- **Wavelet db4**: Removes low-frequency persistent noise using Daubechies wavelet transform.
+- **Wavelet db4**: Removes low-frequency persistent noise using Daubechies wavelet transform
 - **Hampel Filter**: Outlier removal using MAD (Median Absolute Deviation)
 - **Savitzky-Golay Filter**: Polynomial smoothing (enabled by default)
-- **Adaptive Normalization**: Running statistics with Welford's algorithm, with auto-reset to prevent signal degradation
 
-**Filter Pipeline**: Raw CSI → Butterworth (high freq) → Wavelet (low freq) → Hampel → Savitzky-Golay → Normalization
+**Filter Pipeline**: Raw CSI → Butterworth (high freq) → Wavelet (low freq) → Hampel → Savitzky-Golay → Features
 
-**Stage 2: Feature Extraction** (10 mathematical features)
+**Note**: Filters are applied **only to feature extraction**, not to segmentation. Segmentation uses raw CSI data to preserve motion sensitivity.
+
+#### 4️⃣ **Optional Feature Extraction** (ESP32)
+When enabled (default: on), extracts 10 mathematical features from **filtered CSI data** during MOTION state:
 - **Statistical** (5): Variance, Skewness, Kurtosis, Entropy, IQR
 - **Spatial** (3): Spatial variance, correlation, gradient across subcarriers
 - **Temporal** (2): Delta mean, delta variance (changes between consecutive packets)
 
-**Stage 3: Multi-Criteria Detection**
-- Weighted scoring from selected features (4-6 features)
-- Weights optimized via automatic calibration using Fisher's criterion
-- Optimized ranges based on empirical analysis
+**Note**: Feature extraction can be disabled to reduce CPU usage if only basic motion detection is needed.
 
-**Stage 4: State Machine** (2 states)
-- **IDLE**: No movement detected
-- **DETECTED**: Movement detected (score above threshold)
-- Debouncing: Requires consecutive detections (configurable, default: 10)
-- Persistence: Timeout before downgrading state (configurable, default: 3 seconds)
-- Hysteresis: Prevents state flickering using dual thresholds
-
-#### 3️⃣ **MQTT Publishing** (ESP32-S3 → Broker)
+#### 5️⃣ **MQTT Publishing** (ESP32 → Broker)
 - Publishes JSON payload every 1 second (configurable)
 - QoS level 0 (fire-and-forget) for low latency
 - Retained message option for last known state
 - Automatic reconnection on connection loss
 
-#### 4️⃣ **Home Assistant Integration**
+#### 6️⃣ **Home Assistant Integration**
 - **MQTT Sensor** subscribes to topic and creates entity
 - **State**: Primary `movement` value (0.0-1.0)
 - **Attributes**: All other metrics available for conditions
 - **History**: Automatic logging to database for graphs
 
-#### 5️⃣ **Automation & Actions**
-Trigger automations based on:
-- **Numeric state**: `movement > 0.6` (active movement)
-- **Confidence level**: `confidence > 0.7` (high certainty)
-- **State changes**: `idle` → `detected` transitions
-- **Time patterns**: Only during specific hours
-- **Template conditions**: Complex logic combining multiple sensors
-
 </details>
 
 <details>
-<summary>� Feature Extraction & Detection (click to expand)</summary>
+<summary>📊 Optional Feature Extraction (click to expand)</summary>
 
-ESPectre uses a mathematical approach (no ML required) that extracts **10 features** from CSI data:
+ESPectre can optionally extract **10 mathematical features** from CSI data during MOTION state:
 
 ### Extracted Features
 
@@ -404,9 +476,10 @@ Changes between consecutive CSI packets:
 9. **Temporal Delta Mean** - Average absolute difference from previous packet
 10. **Temporal Delta Variance** - Variance of differences from previous packet
 
-### Detection Scoring
+### Usage
 
-The system automatically selects the 4-6 most discriminant features for your specific environment and optimizes their weights using Fisher's criterion. This typically provides better detection accuracy than the default configuration.
+Feature extraction is **enabled by default** but can be disabled to reduce CPU usage.
+**Note**: Features are only extracted during MOTION state, not during IDLE, to optimize performance.
 
 </details>
 
@@ -414,11 +487,19 @@ The system automatically selects the 4-6 most discriminant features for your spe
 <summary>📋 Technical Specifications (click to expand)</summary>
 
 ### Hardware Requirements
-- **Board**: ESP32-S3-DevKitC-1 N16R8
+
+**ESP32-S3:**
+- **Board**: ESP32-S3
 - **Flash**: 16MB
 - **PSRAM**: 8MB
 - **Wi-Fi**: 802.11 b/g/n (2.4 GHz only)
-- **Antenna**: Built-in PCB antenna + IPEX connector for external
+- **Power**: USB-C 5V or 3.3V via pins
+
+**ESP32-C6:**
+- **Board**: ESP32-C6
+- **Flash**: 4MB minimum
+- **PSRAM**: None
+- **Wi-Fi**: 802.11 b/g/n/ax (WiFi 6 tested on 2.4 GHz)
 - **Power**: USB-C 5V or 3.3V via pins
 
 ### Software Requirements
@@ -434,13 +515,14 @@ The system automatically selects the 4-6 most discriminant features for your spe
 - **MQTT Bandwidth**: ~0.2-1 KB/s depending on activity
 - **Power Consumption**: ~500mW typical
 - **Detection Range**: 3-8 meters optimal
-- **Detection Accuracy**: Environment-dependent, requires calibration
+- **Detection Accuracy**: Environment-dependent, requires tuning
 
 ### Limitations
-- Works only on 2.4 GHz band (ESP32-S3 hardware limitation)
+- Currently tested on 2.4 GHz only (ESP32-S3: 2.4 GHz only, ESP32-C6: WiFi 6 on 2.4 GHz tested)
 - Sensitivity dependent on: wall materials, antenna placement, distances, interference
 - Not suitable for environments with very high Wi-Fi traffic
-- Cannot distinguish between multiple people (without ML models)
+- Cannot distinguish between people, pets, or objects (generic motion detection)
+- Cannot count people or recognize specific activities (without ML models)
 - Reduced performance through metal obstacles or thick concrete walls
 
 </details>
@@ -570,6 +652,12 @@ This project builds upon extensive research in Wi-Fi sensing and CSI-based movem
    📄 [Read paper](https://scholarspace.manoa.hawaii.edu/server/api/core/bitstreams/a2d2de7c-7697-485b-97c5-62f4bf1260d0/content)
 
 These references demonstrate that effective Wi-Fi sensing can be achieved through mathematical and statistical approaches, which is the foundation of ESPectre's design philosophy.
+
+---
+
+## 📋 Changelog
+
+For a detailed history of changes, new features, and improvements, see the [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
