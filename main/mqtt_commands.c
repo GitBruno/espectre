@@ -5,6 +5,7 @@
  * License: GPLv3
  */
 
+#include <stdbool.h>
 #include "mqtt_commands.h"
 #include "nvs_storage.h"
 #include "traffic_generator.h"

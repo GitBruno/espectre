@@ -1,5 +1,6 @@
 /*
- * ESPectre - Wi-Fi CSI Movement Detection for ESP32-S3
+ * ESPectre - Wi-Fi CSI Movement Detection
+ * Supports: ESP32-S3, ESP32-C6
  *
  * Uses Channel State Information (CSI) from Wi-Fi packets to detect movement.
  * Extracts 10 mathematical features and combines them with configurable weights
@@ -24,17 +25,15 @@
 #include "esp_timer.h"
 
 // Module headers
-#include "calibration.h"
 #include "nvs_storage.h"
 #include "filters.h"
 #include "csi_processor.h"
-#include "detection_engine.h"
-#include "statistics.h"
 #include "config_manager.h"
-#include "wifi_manager.h"
 #include "mqtt_handler.h"
 #include "mqtt_commands.h"
 #include "traffic_generator.h"
+#include "segmentation.h"
+#include "esp_netif.h"
 
 // Configuration - can be overridden via menuconfig
 #define WIFI_SSID           CONFIG_WIFI_SSID
@@ -48,28 +47,24 @@
 #define LOG_CSI_VALUES_INTERVAL 1
 #define STATS_LOG_INTERVAL  100
 
-// Buffer sizes
-#define STATS_BUFFER_SIZE   100
-
 // Publishing configuration
 #define PUBLISH_INTERVAL    1.0f
+
+// WiFi promiscuous mode (false = receive CSI only from connected AP, true = all WiFi packets)
+#define PROMISCUOUS_MODE    false
+
+// Array of all CSI feature indices (0-9) for feature extraction
+static const uint8_t ALL_CSI_FEATURES[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 
 static const char *TAG = "ESPectre";
 
 static const char *g_response_topic = NULL;
 
+// WiFi event group
+static EventGroupHandle_t s_wifi_event_group = NULL;
+#define WIFI_CONNECTED_BIT BIT0
+
 static struct {
-    stats_buffer_t stats_buffer;
-    
-    float detection_score;
-    float threshold_high;
-    float threshold_low;
-    
-    detection_state_t state;
-    uint8_t consecutive_detections;
-    int64_t last_detection_time;
-    float confidence;
-    
     uint32_t packets_received;
     uint32_t packets_processed;
     _Atomic uint32_t packets_dropped;
@@ -77,9 +72,15 @@ static struct {
     csi_features_t current_features;
     
     // Module instances
-    wifi_manager_state_t wifi_state;
     mqtt_handler_state_t mqtt_state;
     runtime_config_t config;
+    
+    // WiFi state
+    bool wifi_connected;
+    
+    // Segmentation module
+    segmentation_context_t segmentation;
+    segmentation_state_t segmentation_state;
     
 } g_state = {0};
 
@@ -89,17 +90,34 @@ static SemaphoreHandle_t g_state_mutex = NULL;
 // Filter module instances
 static butterworth_filter_t g_butterworth = {0};
 static filter_buffer_t g_filter_buffer = {0};
-static adaptive_normalizer_t g_normalizer = {0};
-
-// Adaptive normalizer reset tracking
-static int64_t g_last_movement_time = 0;
-static uint32_t g_normalizer_reset_count = 0;
+static wavelet_state_t g_wavelet = {0};
 
 // MQTT command context
 static mqtt_cmd_context_t g_mqtt_cmd_context = {0};
 
-// Array of all 10 feature indices (for default mode without calibration)
-static const uint8_t g_all_features[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+// System start time for uptime calculation
+static int64_t g_system_start_time = 0;
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi STA started, attempting connection...");
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGW(TAG, "WiFi disconnected, reason: %d, reconnecting...", disconnected->reason);
+        g_state.wifi_connected = false;
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "WiFi connected, got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        g_state.wifi_connected = true;
+        if (s_wifi_event_group) {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+    }
+}
 
 // MQTT command callback
 static void mqtt_command_callback(const char *data, int data_len) {
@@ -115,18 +133,25 @@ static inline int64_t get_timestamp_sec(void) {
     return esp_timer_get_time() / 1000000;
 }
 
-// Build UTF-8 progress bar with threshold marker
+// Build UTF-8 progress bar with threshold marker at 3/4 position
 static void format_progress_bar(char *buffer, size_t size, float score, float threshold) {
     const int bar_width = 20;
-    int filled = (int)(score * bar_width);
-    int threshold_pos = (int)(threshold * bar_width);
-    int percent = (int)(score * 100);
     
-    // Clamp values
+    // Threshold marker at 3/4 position (15 out of 20)
+    const int threshold_pos = 15;
+    
+    // Calculate percentage: score represents (moving_variance / adaptive_threshold)
+    // At threshold_pos (75% of bar), score should be 1.0 (100% of threshold)
+    // So we scale: filled = score * threshold_pos
+    int filled = (int)(score * threshold_pos);
+    
+    // Clamp filled to bar width
     if (filled < 0) filled = 0;
     if (filled > bar_width) filled = bar_width;
-    if (threshold_pos < 0) threshold_pos = 0;
-    if (threshold_pos > bar_width) threshold_pos = bar_width;
+    
+    // Calculate percentage for display (score * 100)
+    int percent = (int)(score * 100);
+    if (percent > 200) percent = 200;  // Cap at 200% for display
     
     // Build bar directly in output buffer
     int pos = 0;
@@ -146,98 +171,41 @@ static void format_progress_bar(char *buffer, size_t size, float score, float th
 }
 
 static void csi_callback(void *ctx __attribute__((unused)), wifi_csi_info_t *data) {
+    
     int8_t *csi_data = data->buf;
     size_t csi_len = data->len;
     
     if (csi_len < 10) {
+        ESP_LOGW(TAG, "CSI data too short: %d bytes (minimum 10 required)", csi_len);
         return;
     }
+    
+    // Capture raw CSI packet if collection is active
+    mqtt_commands_capture_csi_packet(csi_data, csi_len);
     
     // Protect g_state modifications with mutex (50ms timeout)
     if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         g_state.packets_received++;
         
-        // Extract features from CSI data
-        // Use selective extraction if calibration is available (60-70% CPU savings)
-        uint8_t num_selected = calibration_get_num_selected();
-        if (num_selected > 0) {
-            // Calibrated mode: extract only selected features
-            const uint8_t *selected = calibration_get_selected_features();
+        // Extract features if enabled (always, regardless of state)
+        if (g_state.config.features_enabled) {
             csi_extract_features(csi_data, csi_len, &g_state.current_features,
-                               selected, num_selected);
-        } else {
-            // Default mode: extract all features
-            csi_extract_features(csi_data, csi_len, &g_state.current_features,
-                               g_all_features, sizeof(g_all_features) / sizeof(g_all_features[0]));
+                               ALL_CSI_FEATURES, 10);
         }
         
-        // Feed features to calibration system if active
-        static uint32_t calib_update_count = 0;
+        // MVS Segmentation: Calculate spatial turbulence and update segmentation
+        float turbulence = csi_calculate_spatial_turbulence(csi_data, csi_len,
+                                                            g_state.config.selected_subcarriers,
+                                                            g_state.config.num_selected_subcarriers);
+        bool segment_completed = segmentation_add_turbulence(&g_state.segmentation, turbulence);
         
-        if (calibration_is_active()) {
-            calib_update_count++;
-            if (calib_update_count % 100 == 1) {
-                ESP_LOGI(TAG, "🔬 Calibration active: %u updates sent", calib_update_count);
-            }
-            
-            feature_array_t feat_array;
-            feat_array.features[0] = g_state.current_features.variance;
-            feat_array.features[1] = g_state.current_features.skewness;
-            feat_array.features[2] = g_state.current_features.kurtosis;
-            feat_array.features[3] = g_state.current_features.entropy;
-            feat_array.features[4] = g_state.current_features.iqr;
-            feat_array.features[5] = g_state.current_features.spatial_variance;
-            feat_array.features[6] = g_state.current_features.spatial_correlation;
-            feat_array.features[7] = g_state.current_features.spatial_gradient;
-            
-            calibration_update(&feat_array);
+        // Update segmentation state
+        g_state.segmentation_state = segmentation_get_state(&g_state.segmentation);
+        
+        if (segment_completed) {
+            // A motion segment was just completed
+            ESP_LOGD(TAG, "📍 Motion segment completed");
         }
-        
-        // Calculate detection score
-        detection_config_t det_config = {
-            .threshold_high = g_state.threshold_high,
-            .threshold_low = g_state.threshold_low,
-            .debounce_count = g_state.config.debounce_count,
-            .persistence_timeout = g_state.config.persistence_timeout,
-            .feature_weights = g_state.config.feature_weights  // Pass pointer to array
-        };
-        
-        // Calculate detection score - use calibrated method if available
-        float detection_score;
-        
-        if (num_selected > 0) {
-            // Use calibrated features and weights
-            const uint8_t *selected_features = calibration_get_selected_features();
-            const float *weights = calibration_get_weights();
-            detection_score = detection_calculate_score_calibrated(&g_state.current_features,
-                                                                   selected_features,
-                                                                   weights,
-                                                                   num_selected);
-        } else {
-            // Fallback to default scoring
-            detection_score = detection_calculate_score(&g_state.current_features, &det_config);
-        }
-        
-        // Add to stats buffer
-        stats_buffer_add(&g_state.stats_buffer, detection_score);
-        
-        // Update detection state
-        detection_engine_state_t engine_state = {
-            .current_state = g_state.state,
-            .consecutive_detections = g_state.consecutive_detections,
-            .last_detection_time = g_state.last_detection_time,
-            .last_score = detection_score,
-            .confidence = g_state.confidence
-        };
-        
-        detection_update_state(&engine_state, detection_score, &det_config, get_timestamp_sec());
-        
-        // Update g_state from engine_state
-        g_state.state = engine_state.current_state;
-        g_state.consecutive_detections = engine_state.consecutive_detections;
-        g_state.last_detection_time = engine_state.last_detection_time;
-        g_state.detection_score = detection_score;
-        g_state.confidence = engine_state.confidence;
         
         g_state.packets_processed++;
         
@@ -254,20 +222,95 @@ static void csi_callback(void *ctx __attribute__((unused)), wifi_csi_info_t *dat
 }
 
 static void csi_init(void) {
+    // IMPORTANT: For ESP32-C6, promiscuous mode MUST be enabled BEFORE configuring CSI
+    // This is different from ESP32-S3 where the order doesn't matter
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(PROMISCUOUS_MODE));
+    ESP_LOGI(TAG, "Promiscuous mode: %s", PROMISCUOUS_MODE ? "enabled" : "disabled");
+    
+#if CONFIG_IDF_TARGET_ESP32C6
+    // ESP32-C6 uses wifi_csi_acquire_config_t (different from ESP32-S3!)
+    // Reference: https://github.com/espressif/esp-idf/issues/14271
+    // CRITICAL: Must specify which CSI types to acquire, otherwise callback is never invoked!
     wifi_csi_config_t csi_config = {
-        .lltf_en = true,
-        .htltf_en = true,
-        .stbc_htltf2_en = true,
-        .ltf_merge_en = true,
-        .channel_filter_en = true,
-        .manu_scale = false,
+        .enable = 1,                    // Master enable for CSI acquisition (REQUIRED)
+        
+        .acquire_csi_legacy = 1,        // Acquire L-LTF CSI from legacy 802.11a/g packets
+                                        // CRITICAL: Required for CSI callback to be invoked!
+                                        // Captures channel state from non-HT packets
+        
+        .acquire_csi_ht20 = 1,          // Acquire HT-LTF CSI from 802.11n HT20 packets
+                                        // CRITICAL: Required for CSI from HT packets!
+                                        // Provides improved channel estimation for MIMO
+        
+        .acquire_csi_ht40 = 0,          // Acquire HT-LTF CSI from 802.11n HT40 packets (40MHz bandwidth)
+                                        // Enabled to capture CSI from HT40 packets (128 subcarriers)
+                                        // Router will use HT40 if available and interference is low
+        
+        .acquire_csi_su = 1,            // Acquire HE-LTF CSI from 802.11ax HE20 SU (Single-User) packets
+                                        // Enabled for WiFi 6 support (if router supports 802.11ax)
+        
+        .acquire_csi_mu = 0,            // Acquire HE-LTF CSI from 802.11ax HE20 MU (Multi-User) packets
+                                        // Disabled (not using WiFi 6 MU-MIMO)
+        
+        .acquire_csi_dcm = 0,           // Acquire CSI from DCM (Dual Carrier Modulation) packets
+                                        // DCM is a WiFi 6 feature for long-range transmission
+                                        // Disabled (not used)
+        
+        .acquire_csi_beamformed = 0,    // Acquire CSI from beamformed packets
+                                        // Beamforming directs signal toward receiver
+                                        // Disabled (not needed for motion detection)
+        
+        .acquire_csi_he_stbc = 0,       // Acquire CSI from 802.11ax HE STBC packets
+                                        // STBC improves reliability using multiple antennas
+                                        // Disabled (not used)
+        
+        .val_scale_cfg = 0,             // CSI value scaling configuration (0-8)
+                                        // 0 = automatic scaling (recommended)
+                                        // 1-8 = manual scaling with shift bits
+                                        // Controls normalization of CSI amplitude values
+        
+        .dump_ack_en = 0,               // Enable capture of 802.11 ACK frames
+                                        // Disabled to reduce overhead (ACK frames not needed)
     };
     
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_LOGI(TAG, "CSI initialized and enabled (ESP32-C6 mode)");
+#else
+    // ESP32 and ESP32-S3 use wifi_csi_config_t with legacy LTF fields
+    wifi_csi_config_t csi_config = {
+        .lltf_en = true,                // Enable Legacy Long Training Field (L-LTF) CSI capture
+                                        // L-LTF is present in all 802.11a/g packets
+                                        // Provides base channel estimation (64 subcarriers)
+        
+        .htltf_en = true,               // Enable HT Long Training Field (HT-LTF) CSI capture
+                                        // HT-LTF is present in 802.11n (HT) packets
+                                        // Provides improved channel estimation for MIMO
+        
+        .stbc_htltf2_en = true,         // Enable Space-Time Block Code HT-LTF2 capture
+                                        // STBC uses 2 antennas to improve reliability
+                                        // Captures second HT-LTF when STBC is active
+        
+        .ltf_merge_en = true,           // Merge L-LTF and HT-LTF data by averaging
+                                        // true: Average L-LTF and HT-LTF for HT packets (more stable)
+                                        // false: Use only HT-LTF for HT packets (more precise)
+        
+        .channel_filter_en = false,     // Channel filter to smooth adjacent subcarriers
+                                        // true: Filter/smooth adjacent subcarriers (52 useful subcarriers)
+                                        // false: Keep subcarrier independence (64 total subcarriers)
+                                        // DISABLED to get all raw data without smoothing
+        
+        .manu_scale = false,            // Manual vs automatic CSI data scaling
+                                        // false: Auto-scaling (recommended, adapts dynamically)
+                                        // true: Manual scaling (requires .shift parameter)
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_LOGI(TAG, "CSI initialized and enabled (ESP32/ESP32-S3 mode)");
+#endif
+    
+    // Common CSI setup for all targets
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(csi_callback, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
-    
-    ESP_LOGI(TAG, "CSI initialized and enabled");
 }
 
 static void mqtt_publish_task(void *pvParameters) {
@@ -287,202 +330,79 @@ static void mqtt_publish_task(void *pvParameters) {
         vTaskDelayUntil(&last_wake_time, publish_period);
         
         // Read g_state values with mutex protection
-        float detection_score, threshold_high, confidence;
-        detection_state_t state;
+        segmentation_state_t seg_state;
         uint32_t packets_received, packets_processed;
+        csi_features_t features;
+        bool has_features = false;
         
         if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            detection_score = g_state.detection_score;
-            threshold_high = g_state.threshold_high;
-            confidence = g_state.confidence;
-            state = g_state.state;
+            seg_state = g_state.segmentation_state;
             packets_received = g_state.packets_received;
             packets_processed = g_state.packets_processed;
+            
+            // Copy features if they were extracted
+            if (g_state.config.features_enabled) {
+                features = g_state.current_features;
+                has_features = true;
+            }
+            
             xSemaphoreGive(g_state_mutex);
         } else {
             ESP_LOGW(TAG, "MQTT publish task: Failed to acquire mutex, skipping publish cycle");
             continue;
         }
         
-        // Check calibration and advance phases
-        static calibration_phase_t last_phase = CALIB_IDLE;
-        calibration_phase_t current_phase = calibration_get_phase();
+        // Calculate packet delta (packets processed since last cycle)
+        static uint32_t last_packets_processed = 0;
+        uint32_t packet_delta = packets_processed - last_packets_processed;
+        last_packets_processed = packets_processed;
         
-        // Publish calibration status on phase change
-        if (current_phase != last_phase) {
-            uint32_t samples = calibration_get_samples_collected();
-            
-            // Get phase target samples and traffic rate from calibration system
-            calibration_state_t calib_state;
-            calibration_get_results(&calib_state);
-            uint32_t phase_target = calib_state.phase_target_samples;
-            uint32_t traffic_rate = calib_state.traffic_rate;
-            
-            mqtt_publish_calibration_status(&g_state.mqtt_state, 
-                                          (uint8_t)current_phase,
-                                          phase_target,
-                                          samples,
-                                          traffic_rate,
-                                          g_response_topic);
-        }
-        
-        // Detect calibration completion (when phase becomes ANALYZING)
-        if (current_phase == CALIB_ANALYZING && last_phase != CALIB_ANALYZING) {
-            ESP_LOGI(TAG, "🎉 Calibration analysis complete, applying results...");
-            
-            if (calibration_get_num_selected() > 0) {
-                float optimal_threshold = calibration_get_threshold();
-                
-                if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    float old_threshold = g_state.threshold_high;
-                    g_state.threshold_high = optimal_threshold;
-                    g_state.threshold_low = optimal_threshold * g_state.config.hysteresis_ratio;
-                    xSemaphoreGive(g_state_mutex);
-                    
-                    ESP_LOGI(TAG, "🎯 Applied calibration results: threshold %.4f -> %.4f",
-                             old_threshold, optimal_threshold);
-                }
-                
-                // Apply optimized weights (protected by mutex for thread-safety)
-                const float *weights = calibration_get_weights();
-                const uint8_t *features = calibration_get_selected_features();
-                uint8_t num_selected = calibration_get_num_selected();
-                
-                if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    // Reset all weights to 0
-                    memset(g_state.config.feature_weights, 0, sizeof(g_state.config.feature_weights));
-                    
-                    // Map ALL calibrated features to the weights array
-                    for (uint8_t i = 0; i < num_selected; i++) {
-                        uint8_t feat_idx = features[i];
-                        float weight = weights[i];
-                        
-                        // Map feature index directly to array (supports all 10 features)
-                        if (feat_idx < 10) {
-                            g_state.config.feature_weights[feat_idx] = weight;
-                        } else {
-                            ESP_LOGW(TAG, "Invalid feature index %d (max 9)", feat_idx);
-                        }
-                    }
-                    
-                    xSemaphoreGive(g_state_mutex);
-                    
-                    ESP_LOGI(TAG, "✅ Calibration applied: all %d feature weights updated", num_selected);
-                } else {
-                    ESP_LOGW(TAG, "Failed to acquire mutex for weight update");
-                }
-                
-                // Save to NVS
-                calibration_state_t calib_state;
-                calibration_get_results(&calib_state);
-                nvs_calibration_data_t nvs_calib;
-                nvs_calib.version = NVS_CALIBRATION_VERSION;
-                nvs_calib.num_selected = calib_state.num_selected;
-                memcpy(nvs_calib.selected_features, calib_state.selected_features, 
-                       sizeof(nvs_calib.selected_features));
-                memcpy(nvs_calib.optimized_weights, calib_state.optimized_weights, 
-                       sizeof(nvs_calib.optimized_weights));
-                nvs_calib.optimal_threshold = calib_state.optimal_threshold;
-                memcpy(nvs_calib.feature_min, calib_state.feature_min,
-                       sizeof(nvs_calib.feature_min));
-                memcpy(nvs_calib.feature_max, calib_state.feature_max,
-                       sizeof(nvs_calib.feature_max));
-                
-                esp_err_t calib_err = nvs_save_calibration(&nvs_calib);
-                if (calib_err == ESP_OK) {
-                    ESP_LOGI(TAG, "💾 Calibration data saved to NVS");
-                } else {
-                    ESP_LOGE(TAG, "❌ Failed to save calibration to NVS: %s", esp_err_to_name(calib_err));
-                }
-                
-                esp_err_t config_err = config_save_to_nvs(&g_state.config, g_state.threshold_high, g_state.threshold_low);
-                if (config_err == ESP_OK) {
-                    ESP_LOGI(TAG, "💾 Configuration saved to NVS");
-                } else {
-                    ESP_LOGE(TAG, "❌ Failed to save configuration to NVS: %s", esp_err_to_name(config_err));
-                }
-                
-                // Acknowledge completion to reset calibration phase to IDLE
-                calibration_acknowledge_completion();
-            }
-        }
-        
-        // Detect when calibration fully completes (ANALYZING → IDLE)
-        if (current_phase == CALIB_IDLE && last_phase == CALIB_ANALYZING) {
-            // Send calibration complete recap
-            calibration_state_t calib_state;
-            calibration_get_results(&calib_state);
-            mqtt_publish_calibration_complete(&g_state.mqtt_state, &calib_state, g_response_topic);
-        }
-        
-        last_phase = current_phase;
-        calibration_check_completion();
-        
-        // Adaptive normalizer auto-reset logic
-        if (g_state.config.adaptive_normalizer_enabled && 
-            g_state.config.adaptive_normalizer_reset_timeout_sec > 0) {
-            
-            int64_t current_time = get_timestamp_sec();
-            
-            // Update last movement time
-            if (state != STATE_IDLE) {
-                g_last_movement_time = current_time;
-            }
-            
-            // Check if we should reset the normalizer
-            if (state == STATE_IDLE && g_last_movement_time > 0) {
-                int64_t idle_duration = current_time - g_last_movement_time;
-                
-                if (idle_duration >= (int64_t)g_state.config.adaptive_normalizer_reset_timeout_sec) {
-                    // Reset the normalizer
-                    adaptive_normalizer_init(&g_normalizer, g_state.config.adaptive_normalizer_alpha);
-                    g_normalizer_reset_count++;
-                    g_last_movement_time = current_time;
-                    
-                    ESP_LOGI(TAG, "🔄 Adaptive normalizer reset after %lld sec of IDLE (reset #%u)",
-                             (long long)idle_duration, (unsigned int)g_normalizer_reset_count);
-                }
-            }
-        }
-        
-        // CSI logging with progress bar (skip during calibration to avoid confusion)
+        // CSI logging with progress bar (always enabled)
         int64_t now = get_timestamp_sec();
-        if (g_state.config.csi_logs_enabled && 
-            !calibration_is_active() && 
-            (now - last_csi_log_time >= LOG_CSI_VALUES_INTERVAL)) {
-            const char *state_names[] = {"IDLE", "DETECTED"};
-            const char *state_str = (state < 2) ? state_names[state] : "UNKNOWN";
+        if (now - last_csi_log_time >= LOG_CSI_VALUES_INTERVAL) {
             
-            // Format progress bar with threshold marker (larger buffer to avoid truncation)
+            // Get segmentation data
+            float moving_variance = segmentation_get_moving_variance(&g_state.segmentation);
+            float adaptive_threshold = segmentation_get_threshold(&g_state.segmentation);
+            
+            const char *seg_state_names[] = {"IDLE", "MOTION"};
+            const char *seg_state_str = (seg_state < 2) ? seg_state_names[seg_state] : "UNKNOWN";
+            
+            // Calculate progress based on segmentation (moving_variance / threshold)
+            float seg_progress = (adaptive_threshold > 0.0f) ? (moving_variance / adaptive_threshold) : 0.0f;
+            
+            // Format progress bar with threshold marker at 100%
             char progress_bar[256];
-            format_progress_bar(progress_bar, sizeof(progress_bar), detection_score, threshold_high);
-            
-            // Calculate packet delta (packets processed in last second)
-            static uint32_t last_packets_processed = 0;
-            uint32_t packet_delta = packets_processed - last_packets_processed;
-            last_packets_processed = packets_processed;
+            format_progress_bar(progress_bar, sizeof(progress_bar), seg_progress, 1.0f);
             
             ESP_LOGI(TAG, "📊 %s | pkts:%lu mvmt:%.4f thr:%.4f | %s",
                      progress_bar, (unsigned long)packet_delta, 
-                     detection_score, threshold_high, state_str);
+                     moving_variance, adaptive_threshold, seg_state_str);
             last_csi_log_time = now;
         }
         
-        // Smart publishing
+        // Publish segmentation data
         int64_t current_time = get_timestamp_ms();
+        float moving_variance = segmentation_get_moving_variance(&g_state.segmentation);
         
-        if (mqtt_should_publish(&g_state.mqtt_state, detection_score, state, 
+        if (mqtt_should_publish(&g_state.mqtt_state, moving_variance, seg_state, 
                                 &pub_config, current_time)) {
-            // Prepare detection result
-            detection_result_t result = {
-                .score = detection_score,
-                .confidence = confidence,
-                .state = state,
-                .timestamp = get_timestamp_sec()
+            // Prepare segmentation result
+            segmentation_result_t result = {
+                .moving_variance = moving_variance,
+                .adaptive_threshold = segmentation_get_threshold(&g_state.segmentation),
+                .state = seg_state,
+                .timestamp = get_timestamp_sec(),
+                .packets_processed = packet_delta,
+                .has_features = has_features
             };
             
-            mqtt_publish_detection(&g_state.mqtt_state, &result, MQTT_TOPIC);
-            mqtt_update_publish_state(&g_state.mqtt_state, detection_score, state, current_time);
+            if (has_features) {
+                result.features = features;
+            }
+            
+            mqtt_publish_segmentation(&g_state.mqtt_state, &result, MQTT_TOPIC);
+            mqtt_update_publish_state(&g_state.mqtt_state, moving_variance, seg_state, current_time);
         }
         
         // Statistics logging
@@ -510,6 +430,9 @@ static void mqtt_publish_task(void *pvParameters) {
 void app_main(void) {
     ESP_LOGI(TAG, "System starting...");
     
+    // Record system start time
+    g_system_start_time = esp_timer_get_time() / 1000000;  // Convert to seconds
+    
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -517,6 +440,13 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    
+    // Create WiFi event group
+    s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group) {
+        ESP_LOGE(TAG, "Failed to create WiFi event group");
+        return;
+    }
     
     // Create mutex for g_state protection
     g_state_mutex = xSemaphoreCreateMutex();
@@ -530,27 +460,21 @@ void app_main(void) {
     // Initialize configuration with defaults
     config_init_defaults(&g_state.config);
     
-    // Initialize statistics buffer
-    if (stats_buffer_init(&g_state.stats_buffer, STATS_BUFFER_SIZE) != 0) {
-        ESP_LOGE(TAG, "Failed to initialize statistics buffer");
-        vSemaphoreDelete(g_state_mutex);
-        return;
-    }
-    
-    // Set default thresholds
-    g_state.threshold_high = DEFAULT_THRESHOLD;
-    g_state.threshold_low = DEFAULT_THRESHOLD * g_state.config.hysteresis_ratio;
-    
     // Initialize filter modules
     filter_buffer_init(&g_filter_buffer);
-    adaptive_normalizer_init(&g_normalizer, g_state.config.adaptive_normalizer_alpha);
+    butterworth_init(&g_butterworth);
+    wavelet_init(&g_wavelet, g_state.config.wavelet_level, 
+                 g_state.config.wavelet_threshold, WAVELET_THRESH_SOFT);
     
-    // Initialize adaptive normalizer reset tracking
-    g_last_movement_time = get_timestamp_sec();
-    g_normalizer_reset_count = 0;
+    // Initialize segmentation system
+    segmentation_init(&g_state.segmentation);
+    ESP_LOGI(TAG, "📍 Segmentation module initialized");
     
-    // Initialize calibration system
-    calibration_init();
+    // Initialize CSI processor with default subcarrier selection
+    csi_set_subcarrier_selection(g_state.config.selected_subcarriers,
+                                 g_state.config.num_selected_subcarriers);
+    ESP_LOGI(TAG, "📡 CSI processor initialized with %d subcarriers", 
+             g_state.config.num_selected_subcarriers);
     
     // Initialize NVS storage
     nvs_storage_init();
@@ -562,98 +486,99 @@ void app_main(void) {
             // Load config parameters (pass nvs_cfg to avoid duplicate NVS read)
             config_load_from_nvs(&g_state.config, &nvs_cfg);
             
-            // Load thresholds from NVS
-            g_state.threshold_high = nvs_cfg.threshold_high;
-            g_state.threshold_low = nvs_cfg.threshold_low;
+            // Apply segmentation parameters from config
+            segmentation_set_k_factor(&g_state.segmentation, g_state.config.segmentation_k_factor);
+            segmentation_set_window_size(&g_state.segmentation, g_state.config.segmentation_window_size);
+            segmentation_set_min_length(&g_state.segmentation, g_state.config.segmentation_min_length);
+            segmentation_set_max_length(&g_state.segmentation, g_state.config.segmentation_max_length);
             
-            ESP_LOGI(TAG, "💾 Loaded saved configuration from NVS");
-            ESP_LOGI(TAG, "🎯 Loaded thresholds: high=%.4f, low=%.4f",
-                     g_state.threshold_high, g_state.threshold_low);
-        }
-    }
-    
-    // Load saved calibration if exists
-    if (nvs_has_calibration()) {
-        ESP_LOGI(TAG, "🔍 Calibration data found in NVS, loading...");
-        nvs_calibration_data_t nvs_calib;
-        if (nvs_load_calibration(&nvs_calib) == ESP_OK) {
-            ESP_LOGI(TAG, "📥 NVS calibration loaded: %d features, threshold=%.4f",
-                     nvs_calib.num_selected, nvs_calib.optimal_threshold);
+            // Load segmentation threshold from NVS
+            segmentation_set_threshold(&g_state.segmentation, nvs_cfg.segmentation_threshold);
             
-            calibration_state_t calib_state = {0};
-            calib_state.num_selected = nvs_calib.num_selected;
-            calib_state.optimal_threshold = nvs_calib.optimal_threshold;
-            memcpy(calib_state.selected_features, nvs_calib.selected_features, 
-                   sizeof(calib_state.selected_features));
-            memcpy(calib_state.optimized_weights, nvs_calib.optimized_weights, 
-                   sizeof(calib_state.optimized_weights));
-            memcpy(calib_state.feature_min, nvs_calib.feature_min,
-                   sizeof(calib_state.feature_min));
-            memcpy(calib_state.feature_max, nvs_calib.feature_max,
-                   sizeof(calib_state.feature_max));
-            
-            // Apply to calibration system
-            calibration_apply_saved(&calib_state);
-            
-            // Update thresholds
-            g_state.threshold_high = nvs_calib.optimal_threshold;
-            g_state.threshold_low = nvs_calib.optimal_threshold * g_state.config.hysteresis_ratio;
-            ESP_LOGI(TAG, "🎯 Thresholds updated: high=%.4f, low=%.4f",
-                     g_state.threshold_high, g_state.threshold_low);
-            
-            // Apply loaded weights to config
-            const uint8_t *features = calib_state.selected_features;
-            const float *weights = calib_state.optimized_weights;
-            
-            // Feature names mapping (all 10 features)
-            const char *feature_names[] = {
-                "variance", "skewness", "kurtosis", "entropy", "iqr",
-                "spatial_variance", "spatial_correlation", "spatial_gradient",
-                "temporal_delta_mean", "temporal_delta_variance"
-            };
-            
-            // Reset all weights to 0
-            memset(g_state.config.feature_weights, 0, sizeof(g_state.config.feature_weights));
-            
-            // Apply calibrated weights to array (supports ALL 10 features)
-            ESP_LOGI(TAG, "⚖️  Applying calibrated weights:");
-            for (uint8_t i = 0; i < calib_state.num_selected; i++) {
-                uint8_t feat_idx = features[i];
-                float weight = weights[i];
-                
-                const char *feat_name = (feat_idx < 10) ? feature_names[feat_idx] : "invalid";
-                
-                // Map feature index directly to array (supports all 10 features)
-                if (feat_idx < 10) {
-                    g_state.config.feature_weights[feat_idx] = weight;
-                    ESP_LOGI(TAG, "  Feature[%d] %s: weight=%.4f", feat_idx, feat_name, weight);
-                } else {
-                    ESP_LOGW(TAG, "  Invalid feature index: %d", feat_idx);
-                }
+            // Load subcarrier selection from NVS
+            if (nvs_cfg.num_selected_subcarriers > 0) {
+                csi_set_subcarrier_selection(nvs_cfg.selected_subcarriers,
+                                            nvs_cfg.num_selected_subcarriers);
+                ESP_LOGI(TAG, "📡 Loaded subcarrier selection: %d subcarriers", 
+                         nvs_cfg.num_selected_subcarriers);
             }
             
-            ESP_LOGI(TAG, "✅ All %d calibrated feature weights applied to array", calib_state.num_selected);
-            
-            ESP_LOGI(TAG, "💾 Saved calibration successfully applied");
-        } else {
-            ESP_LOGE(TAG, "❌ Failed to load calibration from NVS");
+            ESP_LOGI(TAG, "💾 Loaded saved configuration from NVS");
+            ESP_LOGI(TAG, "📍 Segmentation: threshold=%.2f, K=%.2f, window=%d, min=%d, max=%d",
+                     nvs_cfg.segmentation_threshold,
+                     g_state.config.segmentation_k_factor,
+                     g_state.config.segmentation_window_size,
+                     g_state.config.segmentation_min_length,
+                     g_state.config.segmentation_max_length);
         }
-    } else {
-        ESP_LOGI(TAG, "ℹ️  No saved calibration found in NVS, using defaults");
     }
     
     // Initialize WiFi
-    wifi_credentials_t wifi_creds = {
-        .ssid = WIFI_SSID,
-        .password = WIFI_PASSWORD
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    g_state.wifi_connected = false;
+    
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid) - 1] = '\0';
+    strncpy((char *)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = '\0';
+    
+    ESP_LOGI(TAG, "WiFi SSID: %s", wifi_config.sta.ssid);
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    
+    // Configure Wi-Fi country code (regulatory compliance)
+    // Note: schan=1 and nchan=13 are standard initial values.
+    // With WIFI_COUNTRY_POLICY_AUTO, the ESP32 driver automatically adapts
+    // the channel range based on the country code (e.g., 1-11 for US, 1-13 for EU, 1-14 for JP).
+    wifi_country_t country = {
+        .cc = CONFIG_WIFI_COUNTRY_CODE,
+        .schan = 1,        // Standard start channel (driver adapts based on country code)
+        .nchan = 13,       // Standard channel count (driver adapts based on country code)
+        .policy = WIFI_COUNTRY_POLICY_AUTO,
     };
+    ESP_ERROR_CHECK(esp_wifi_set_country(&country));
+    ESP_LOGI(TAG, "Wi-Fi country code set to %s (channels auto-configured by driver)", 
+             CONFIG_WIFI_COUNTRY_CODE);
     
-    if (wifi_manager_init(&g_state.wifi_state, &wifi_creds) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize WiFi");
-        return;
-    }
+    ESP_ERROR_CHECK(esp_wifi_start());
     
-    wifi_manager_wait_connected();
+    // Configure Wi-Fi power management (disable for real-time CSI with minimal latency)
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG, "Wi-Fi power save disabled for real-time CSI");
+    
+    // Configure Wi-Fi protocol mode
+#if CONFIG_IDF_TARGET_ESP32C6
+    // ESP32-C6: Enable WiFi 6 (802.11ax) for improved performance and CSI capture
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, 
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX));
+    ESP_LOGI(TAG, "Wi-Fi protocol set to 802.11b/g/n/ax (WiFi 6 enabled)");
+#else
+    // ESP32-S3: WiFi 4 only (802.11b/g/n)
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, 
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    ESP_LOGI(TAG, "Wi-Fi protocol set to 802.11b/g/n");
+#endif
+    
+    // Configure Wi-Fi bandwidth (HT20 for stability, HT40 for more subcarriers)
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+    ESP_LOGI(TAG, "Wi-Fi bandwidth set to HT20 (20MHz)");
+    
+    // Wait for WiFi connection
+    ESP_LOGI(TAG, "Waiting for WiFi connection...");
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "WiFi connected successfully");
     
     // Initialize MQTT
     mqtt_config_t mqtt_cfg = {
@@ -680,17 +605,15 @@ void app_main(void) {
     
     // Setup MQTT command context
     g_mqtt_cmd_context.config = &g_state.config;
-    g_mqtt_cmd_context.threshold_high = &g_state.threshold_high;
-    g_mqtt_cmd_context.threshold_low = &g_state.threshold_low;
-    g_mqtt_cmd_context.stats_buffer = &g_state.stats_buffer;
     g_mqtt_cmd_context.current_features = &g_state.current_features;
-    g_mqtt_cmd_context.current_state = &g_state.state;
+    g_mqtt_cmd_context.current_state = &g_state.segmentation_state;
     g_mqtt_cmd_context.butterworth = &g_butterworth;
     g_mqtt_cmd_context.filter_buffer = &g_filter_buffer;
-    g_mqtt_cmd_context.normalizer = &g_normalizer;
+    g_mqtt_cmd_context.segmentation = &g_state.segmentation;
     g_mqtt_cmd_context.mqtt_base_topic = mqtt_cfg.base_topic;
     g_mqtt_cmd_context.mqtt_cmd_topic = mqtt_cfg.cmd_topic;
     g_mqtt_cmd_context.mqtt_response_topic = mqtt_cfg.response_topic;
+    g_mqtt_cmd_context.system_start_time = &g_system_start_time;
     
     // Initialize MQTT commands
     if (mqtt_commands_init(&g_state.mqtt_state, &g_mqtt_cmd_context) != 0) {

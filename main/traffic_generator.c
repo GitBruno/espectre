@@ -11,6 +11,7 @@
  * License: GPLv3
  */
 
+#include <stdbool.h>
 #include "traffic_generator.h"
 #include "esp_log.h"
 #include "esp_netif.h"

@@ -5,6 +5,7 @@
  * License: GPLv3
  */
 
+#include <stdbool.h>
 #include "filters.h"
 #include <string.h>
 #include <math.h>

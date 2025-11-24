@@ -5,6 +5,7 @@
  * License: GPLv3
  */
 
+#include <stdbool.h>
 #include "config_manager.h"
 #include "nvs_storage.h"
 #include "segmentation.h"

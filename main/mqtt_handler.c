@@ -5,6 +5,7 @@
  * License: GPLv3
  */
 
+#include <stdbool.h>
 #include "mqtt_handler.h"
 #include <string.h>
 #include <math.h>
