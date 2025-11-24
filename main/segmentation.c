@@ -5,6 +5,7 @@
  * License: GPLv3
  */
 
+#include <stdbool.h>
 #include "segmentation.h"
 #include <stdlib.h>
 #include <string.h>
